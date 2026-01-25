@@ -6,7 +6,7 @@ from typing import Optional, Callable
 from einops import rearrange
 
 # Constants
-lamda_stability = 1e-6  # for numerical stability in x-update
+lamda_stability = 1e-12  # for numerical stability in x-update
 
 def detach_state(*args):
     return [x.detach() for x in args]
@@ -164,6 +164,7 @@ def admm_min_quadratic_peak_norm_constraint(L: torch.Tensor,
     Solves:
     min_{x, t} x^T L x
     s.t. b_l <= Ax <= b_u
+         ||T_k x||_2 <= t for k=1...K
          
     Args
     ----

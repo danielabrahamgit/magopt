@@ -8,14 +8,64 @@ from .elip import EllipELookup, EllipKLookup
 MU0 = 4e-7 * torch.pi # T*m/A
 EPSILON_STABILITY = 1e-9 # Small value to avoid division by zero in calculations
 
+def _transform_coordinates(crds: torch.Tensor,
+                           center: torch.Tensor,
+                           normal: torch.Tensor,
+                           flip_order: bool = False) -> torch.Tensor:
+    """
+    Rotates the spatial coordinates the z-axis maps to 'normal',
+    and the center of the coordinate system is at 'center'
+    
+    Args:
+    -----
+    crds : torch.Tensor
+        Spatial coordinates with shape (..., 3) in units [m]
+    center : torch.Tensor
+        Center of the coordinate system in units [m] with shape (..., 3)
+    normal : torch.Tensor
+        Normal vector of the coordinate system in units [m] with shape (..., 3)
+    flip_order : bool
+        If True, the translation/rotation order is flipped.
+
+    Returns:
+    --------
+    transformed_crds : torch.Tensor
+        Transformed spatial coordinates with shape (..., 3) in units [m]
+    """
+    # Check normal
+    assert (normal.norm(dim=-1) - 1.0).abs().max() < 1e-5, "Normal vector must be a unit vector"
+    
+    # Move to same device
+    center = center.to(crds.device)
+    normal = normal.to(crds.device)
+    
+    # First construct an arbitrary rotation matrix that maps the z-axis to 'normal's
+    basis_vec = torch.zeros_like(crds)
+    basis_vec[..., 0] = 1.0
+    # if (basis_vec @ normal).abs() > 0.999:
+    #     basis_vec = torch.tensor([0, 1, 0], device=crds.device, dtype=crds.dtype)
+    xp = torch.cross(basis_vec, normal, dim=-1)
+    xp = xp / xp.norm(dim=-1, keepdim=True)
+    yp = torch.cross(normal, xp, dim=-1)
+    zp = normal + xp * 0
+    Rot = torch.stack([xp, yp, zp], dim=-1)
+    
+    # Transform coordinates
+    if flip_order:
+        transformed_crds = (crds[..., None] * Rot.mT).sum(dim=-2) + center
+    else:
+        transformed_crds = ((crds - center)[..., None] * Rot).sum(dim=-2)
+    return transformed_crds
+
 def calc_mag_potential_loop(spatial_crds: torch.Tensor, 
                             R: float,
-                            z_ofs: Optional[float] = 0.0,
+                            center: Optional[torch.Tensor] = torch.zeros(3),
+                            normal: Optional[torch.Tensor] = torch.tensor([0, 0, 1]),
                             ellipe: Optional[torch.nn.Module] = EllipELookup(),
                             ellipk: Optional[torch.nn.Module] = EllipKLookup()) -> torch.Tensor:
     """
-    Calculates the magnetic potential at a point in space due to 
-    a circular loop of current lying in the XY plane at Z=0.
+    Calculates the magnetic potential at any point in space due to 
+    a circular loop of current
 
     Args:
     -----
@@ -23,16 +73,22 @@ def calc_mag_potential_loop(spatial_crds: torch.Tensor,
         Spatial coordinates with shape (..., 3) in units [m]
     R : float
         Radius of the circular loop in units [m]
+    center : torch.Tensor
+        Center of the circular loop in units [m]
+    normal : torch.Tensor
+        Normal vector of the circular loop in units [m]
 
     Returns:
     --------
     A : torch.Tensor
         The magnetic potential with shape (..., 3) in units [T*m]
     """
+    # Transform coordinates
+    spatial_crds = _transform_coordinates(spatial_crds, center, normal)
     
     # Convert to cylindrical coordinates
     rho = (spatial_crds[..., 0] ** 2 + spatial_crds[..., 1] ** 2 + EPSILON_STABILITY).sqrt()
-    z = spatial_crds[..., 2] - z_ofs
+    z = spatial_crds[..., 2]
     
     # # Compute the magnetic potential in azimuthal direction
     # k = ((4 * R * rho) / ((rho + R) ** 2 + z ** 2)).sqrt()
@@ -52,7 +108,8 @@ def calc_mag_potential_loop(spatial_crds: torch.Tensor,
 
 def calc_bfield_loop(spatial_crds: torch.Tensor,
                      R: float,
-                     z_ofs: Optional[float] = 0.0,
+                     center: Optional[torch.Tensor] = torch.zeros(3),
+                     normal: Optional[torch.Tensor] = torch.tensor([0, 0, 1]),
                      ellipe: Optional[torch.nn.Module] = EllipELookup(),
                      ellipk: Optional[torch.nn.Module] = EllipKLookup()) -> torch.Tensor:
     """
@@ -64,16 +121,23 @@ def calc_bfield_loop(spatial_crds: torch.Tensor,
     spatial_crds : torch.Tensor
         Spatial coordinates with shape (..., 3) in units [m]
     R : float
-        Radius of the circular loop in units [m]
-    
+        Radius of the circular loop in units [m] with shape (...,)
+    center : torch.Tensor
+        Center of the circular loop in units [m] with shape (..., 3)
+    normal : torch.Tensor
+        Normal vector of the circular loop in units [m] with shape (..., 3)
+
     Returns:
     --------
     bfield : torch.Tensor
         The magnetic field with shape (..., 3) in units [T]
     """
+    # Transform coordinates
+    spatial_crds = _transform_coordinates(spatial_crds, center, normal)
+    
     # Convert to cylindrical coordinates
     rho = (spatial_crds[..., 0] ** 2 + spatial_crds[..., 1] ** 2).sqrt()
-    z = spatial_crds[..., 2] - z_ofs
+    z = spatial_crds[..., 2]
     
     # Compute constant/shared terms
     const = MU0 / (2 * torch.pi * ((rho + R).square() + z.square()).sqrt())
@@ -204,7 +268,8 @@ def _dEdm(m, K, E, eps=1e-12):
 def calc_bfield_loop_jacobian(
     spatial_crds: torch.Tensor,
     R: float,
-    z_ofs: Optional[float] = 0.0,
+    center: Optional[torch.Tensor] = torch.zeros(3),
+    normal: Optional[torch.Tensor] = torch.tensor([0, 0, 1]),
     ellipe: Optional[torch.nn.Module] = EllipELookup(),
     ellipk: Optional[torch.nn.Module] = EllipKLookup()) -> torch.Tensor:
     """
@@ -213,13 +278,15 @@ def calc_bfield_loop_jacobian(
     
     Much thanks to Chat-GPT 5o!
     """
+    # Transform coordinates
+    spatial_crds = _transform_coordinates(spatial_crds, center, normal)
 
     if ellipe is None or ellipk is None:
         raise ValueError("Provide elliptic integral modules ellipe and ellipk.")
 
     x = spatial_crds[..., 0]
     y = spatial_crds[..., 1]
-    z = spatial_crds[..., 2] - z_ofs
+    z = spatial_crds[..., 2]
 
     rho = torch.sqrt(x*x + y*y + EPSILON_STABILITY)  # stabilized radius
     cosphi = x / (rho + EPSILON_STABILITY)
