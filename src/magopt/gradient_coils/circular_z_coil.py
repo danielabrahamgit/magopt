@@ -154,30 +154,32 @@ class circular_z_coil(gradient_coil):
             
         Returns
         -------
-        bfield_mat : torch.Tensor
-            shape (Nb, Ncoeff, 3) mapping coil coefficients to magnetic fields Bx, By, Bz
         gfield_mat : torch.Tensor
-            shape (Ng, Ncoeff, 3) mapping coil coefficients to gradient fields dBz/dx, dBz/dy, dBz/dz
+            shape (3, Ng, Ncoeff) mapping coil coefficients to gradient fields dBz/dx, dBz/dy, dBz/dz
+        bfield_mat : torch.Tensor
+            shape (3, Nb, Ncoeff) mapping coil coefficients to magnetic fields Bx, By, Bz
         efield_mat : torch.Tensor
-            shape (Ne, Ncoeff, 3) mapping coil coefficients to electric fields Ex, Ey, Ez
+            shape (3, Ne, Ncoeff) mapping coil coefficients to electric fields Ex, Ey, Ez
         """
         # Get coil geometry
         zs = self.get_coil_zs()
         rs = self.interp_rs(zs)
         
         # Compute gradient fields
-        gfields_mat = calc_bfield_loop_jacobian(crds_gfield[:, None], rs[None,], zs[None,], self.elip_e, self.elip_k)[..., -1, :]
+        centers = torch.stack([zs*0, zs*0, zs], dim=-1)
+        normals = torch.stack([zs*0, zs*0, zs*0 + 1], dim=-1)
+        gfields_mat = calc_bfield_loop_jacobian(crds_gfield[:, None], rs[None,], centers[None,], normals[None,], self.elip_e, self.elip_k)[..., -1, :]
         gfields_mat = rearrange(gfields_mat, 'Nb N d -> d Nb N') @ self.Imat
         
         # Compute magnetic fields
-        bfields_mat = calc_bfield_loop(crds_bfield[:, None], rs[None,], zs[None,], self.elip_e, self.elip_k)
+        bfields_mat = calc_bfield_loop(crds_bfield[:, None], rs[None,], centers[None,], normals[None,], self.elip_e, self.elip_k)
         bfields_mat = rearrange(bfields_mat, 'Nb N d -> d Nb N') @ self.Imat
         
         # Compute magnetic potential
-        afields_mat = calc_mag_potential_loop(crds_efield[:, None], rs[None,], zs[None,], self.elip_e, self.elip_k)
-        afields_mat = rearrange(afields_mat, 'Ne N d -> d Ne N') @ self.Imat
+        afields_mat = calc_mag_potential_loop(crds_efield[:, None], rs[None,], centers[None,], normals[None,], self.elip_e, self.elip_k)
+        afields_mat = rearrange(afields_mat, 'Ne N d -> d Ne N') @ self.Imat        
 
-        return bfields_mat.moveaxis(0, -1), gfields_mat.moveaxis(0, -1), afields_mat.moveaxis(0, -1)
+        return gfields_mat, bfields_mat, afields_mat
 
     def evaluate_fields(self,
                         coeffs: torch.Tensor,

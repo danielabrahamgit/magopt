@@ -5,12 +5,13 @@ from typing import Optional
 from einops import rearrange
 from .gradient_coil import gradient_coil
 from ..sim.elip import EllipELookup, EllipKLookup
+from ..sim import parametric_wire
 from ..sim.analytic import (
     calc_bfield_loop_jacobian, 
     calc_bfield_loop,
     calc_inductance_loop, 
     calc_mag_potential_loop,
-    _transform_coordinates
+    _transform_coordinates,
 )
 
 class matrix_coil(gradient_coil):
@@ -74,32 +75,73 @@ class matrix_coil(gradient_coil):
         # Convert phis_thetas to normal vectors
         normals = self._get_normals()
         
-        # Magnetic fields
-        bfield_mat = calc_bfield_loop(spatial_crds=crds_bfield[None, :, :], 
-                                      R=self.radii[:, None], 
-                                      center=self.centers[:, None, :], 
-                                      normal=normals[:, None, :],
-                                      ellipe=self.elip_e,
-                                      ellipk=self.elip_k)
-        bfield_mat = rearrange(bfield_mat, 'Ncoeff Nb three -> three Nb Ncoeff')
-        
-        # Gradient fields
-        gfield_mat = calc_bfield_loop_jacobian(spatial_crds=crds_gfield[None, :, :], 
-                                               R=self.radii[:, None], 
-                                               center=self.centers[:, None, :], 
-                                               normal=normals[:, None, :],
-                                               ellipe=self.elip_e,
-                                               ellipk=self.elip_k)[..., -1, :]
-        gfield_mat = rearrange(gfield_mat, 'Ncoeff Nb three -> three Nb Ncoeff')
-        
-        # Magnetic potential fields
-        afield_mat = calc_mag_potential_loop(spatial_crds=crds_efield[None, :, :], 
-                                             R=self.radii[:, None], 
-                                             center=self.centers[:, None, :], 
-                                             normal=normals[:, None, :],
-                                             ellipe=self.elip_e,
-                                             ellipk=self.elip_k)
-        afield_mat = rearrange(afield_mat, 'Ncoeff Ne three -> three Ne Ncoeff')
+        # Parametric wire method
+        if True:
+            
+            # Gen base loop coordinates
+            thetas = torch.linspace(0, 2 * torch.pi, 100, 
+                                    device=self.radii.device)
+            xs = torch.cos(thetas)
+            ys = torch.sin(thetas)
+            zs = torch.zeros_like(thetas)
+            crds_loop = torch.stack([xs, ys, zs], dim=-1)
+            
+            # Transform to loop to point in normal direction
+            crds_loop_new = _transform_coordinates(self.radii[:, None, None] * crds_loop[None, :, :], 
+                                                   self.centers[:, None, :], 
+                                                   normals[:, None, :],
+                                                   flip_order=True)
+            
+            # Compute fields per loop 
+            bfields = []
+            gfields = []
+            afields = []
+            for i in range(len(self.radii)):
+                
+                # Create parametric wire
+                pw = parametric_wire(wire_pts=crds_loop_new[i], verbose=False)
+                
+                # Magnetic field
+                bfield = pw.calc_bfield(spatial_crds=crds_bfield)
+                gfield = pw.calc_bfield_jacobian(spatial_crds=crds_gfield)[..., -1, :]
+                afield = pw.calc_mag_potential(spatial_crds=crds_efield)
+                
+                bfields.append(bfield.T)
+                gfields.append(gfield.T)
+                afields.append(afield.T)
+                
+            bfield_mat = torch.stack(bfields, dim=-1)
+            gfield_mat = torch.stack(gfields, dim=-1)
+            afield_mat = torch.stack(afields, dim=-1)
+            
+        # Analytical method
+        else:
+            # Magnetic fields
+            bfield_mat = calc_bfield_loop(spatial_crds=crds_bfield[None, :, :], 
+                                          R=self.radii[:, None], 
+                                          center=self.centers[:, None, :], 
+                                          normal=normals[:, None, :],
+                                          ellipe=self.elip_e,
+                                          ellipk=self.elip_k)
+            bfield_mat = rearrange(bfield_mat, 'Ncoeff Nb three -> three Nb Ncoeff')
+            
+            # Gradient fields
+            gfield_mat = calc_bfield_loop_jacobian(spatial_crds=crds_gfield[None, :, :], 
+                                                   R=self.radii[:, None], 
+                                                   center=self.centers[:, None, :], 
+                                                   normal=normals[:, None, :],
+                                                   ellipe=self.elip_e,
+                                                   ellipk=self.elip_k)[..., -1, :]
+            gfield_mat = rearrange(gfield_mat, 'Ncoeff Nb three -> three Nb Ncoeff')
+            
+            # Magnetic potential fields
+            afield_mat = calc_mag_potential_loop(spatial_crds=crds_efield[None, :, :], 
+                                                R=self.radii[:, None], 
+                                                center=self.centers[:, None, :], 
+                                                normal=normals[:, None, :],
+                                                ellipe=self.elip_e,
+                                                ellipk=self.elip_k)
+            afield_mat = rearrange(afield_mat, 'Ncoeff Ne three -> three Ne Ncoeff')
         
         return gfield_mat, bfield_mat, afield_mat
         
@@ -141,6 +183,10 @@ class matrix_coil(gradient_coil):
         zs = torch.zeros_like(thetas)
         crds_loop = torch.stack([xs, ys, zs], dim=-1)
         normals = self._get_normals()
+        
+        # Colors from coeffs
+        vals = (coeffs / coeffs.abs().max()) ** 3
+        vals = vals.cpu()
     
         # Plot each loop in 3D with varying colors based on current
         for i in range(len(self.radii)):
@@ -155,9 +201,21 @@ class matrix_coil(gradient_coil):
                                                    n[None, :],
                                                    flip_order=True).cpu()
             
+            # Use RDBu_R colormap for current values
+            # -1 --> blue, 0 ---> white, 1 --> red
+            # colors = plt.get_cmap('RdBu_r')((vals[i] + 1) / 2) 
+            colors = 'black'
+            
             # Plot
-            ax.plot(crds_loop_new[..., 0], crds_loop_new[..., 1], crds_loop_new[..., 2], color='r')
+            ax.plot(crds_loop_new[..., 0], crds_loop_new[..., 1], crds_loop_new[..., 2], color=colors)
             
         ax.axis('equal')
+        
+        # Show loop coefficients
+        fig = plt.figure()
+        axl = fig.add_subplot(111)
+        axl.plot(coeffs.cpu().flip(dims=[0]))
+        axl.set_title('Loop Coefficients')
+        axl.set_ylabel('Current (A-turns)')
             
-        return fig, ax
+        return fig, ax, axl

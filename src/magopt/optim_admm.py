@@ -148,6 +148,623 @@ def solve_epigraph_group_l2(y, lam, max_iter=20, tol=1e-6):
     z = y * scales
     return z, t
 
+@torch.no_grad()
+def e_block_update_exact(v: torch.Tensor,
+                         lambdaE: float | torch.Tensor,
+                         rhoE: float | torch.Tensor,
+                         e_fixed: float | torch.Tensor | None = None,
+                         vec_dim: int = -1,
+                         eps: float = 1e-12) -> tuple[torch.Tensor, float]:
+    """
+    Exact (non-differentiable) E-block ADMM update.
+
+    Solves:
+        min_{z_k, e>=0} lambdaE*e + (rhoE/2) * sum_k ||z_k - v_k||^2
+        s.t. ||z_k|| <= e  for all k
+
+    where v_k are provided as `v`.
+
+    Args
+    ----
+    v : Tensor
+        Stacked v_k. Shape: (K, ..., D) where D is the vector dimension over which ||.||_2 is computed.
+        The "k index" is assumed to be dimension 0 (K).
+    lambdaE, rhoE : float or Tensor
+        Scalars.
+    e_fixed : float or Tensor or None
+        If not None, hard-sets e = e_fixed and only projects z_k onto the ball of radius e.
+    vec_dim : int
+        Dimension of the vector entries (default: last dim).
+    eps : float
+        Small constant for numerical stability.
+
+    Returns
+    -------
+    z : Tensor
+        Same shape as v, with each v_k projected onto the l2 ball radius e.
+    e : Tensor (scalar)
+        Optimal (or fixed) Emax.
+    """
+    if v.numel() == 0:
+        raise ValueError("v must be non-empty.")
+    if v.shape[0] == 0:
+        raise ValueError("First dimension of v (K) must be > 0.")
+
+    device, dtype = v.device, v.dtype
+    lam = torch.as_tensor(lambdaE, device=device, dtype=dtype)
+    rho = torch.as_tensor(rhoE, device=device, dtype=dtype)
+
+    # Compute a_k = ||v_k||_2
+    # Assume k is dim 0; compute norm over vec_dim.
+    # If vec_dim is negative, it refers to indexing in v; keep as-is.
+    a = torch.linalg.vector_norm(v, ord=2, dim=vec_dim)  # shape: (K, ...)
+
+    # This solver assumes one scalar e shared across *all* k and all other batch dims.
+    # So we flatten all a entries into one list of radii.
+    a_flat = a.reshape(-1)
+
+    # Hard-set e case
+    if e_fixed is not None:
+        e = torch.as_tensor(e_fixed, device=device, dtype=dtype).clamp_min(0.0)
+        # project each v elementwise by scaling factor min(1, e/||v||)
+        v_norm = torch.linalg.vector_norm(v, ord=2, dim=vec_dim, keepdim=True).clamp_min(eps)
+        scale = torch.clamp(e / v_norm, max=1.0)
+        z = v * scale
+        return z, e
+
+    # If lambdaE <= 0, objective would push e -> +inf (not your use case).
+    # If lambdaE is very small, e tends toward max ||v_k||.
+    # The optimality is: e* = argmin_{e>=0} lam e + (rho/2) sum (max(0, a_k - e))^2
+
+    # Sort descending: a_(1) >= a_(2) >= ... >= a_(N)
+    a_sorted, _ = torch.sort(a_flat, descending=True)
+    N = a_sorted.numel()
+
+    # Prefix sums S_m = sum_{i=1}^m a_(i)
+    S = torch.cumsum(a_sorted, dim=0)
+
+    # Candidates e_m = (S_m - lam/rho)/m for m=1..N
+    target = lam / (rho + eps)
+    m = torch.arange(1, N + 1, device=device, dtype=dtype)
+    e_cand = (S - target) / m
+
+    # Enforce e >= 0
+    e_cand = torch.clamp(e_cand, min=0.0)
+
+    # Valid interval condition for descending sort:
+    # a_m >= e_m >= a_{m+1}, with a_{N+1} := 0
+    a_next = torch.empty_like(a_sorted)
+    a_next[:-1] = a_sorted[1:]
+    a_next[-1] = torch.zeros((), device=device, dtype=dtype)
+
+    valid = (e_cand <= a_sorted + 1e-14) & (e_cand >= a_next - 1e-14)
+
+    if valid.any():
+        idx = torch.nonzero(valid, as_tuple=False)[0, 0]
+        e = e_cand[idx]
+    else:
+        # Fallback (rare numerical corner): if all invalid, choose e=0
+        e = torch.zeros((), device=device, dtype=dtype)
+
+    # Project each v_k onto l2-ball radius e: z_k = v_k * min(1, e/||v_k||)
+    v_norm = torch.linalg.vector_norm(v, ord=2, dim=vec_dim, keepdim=True).clamp_min(eps)
+    scale = torch.clamp(e / v_norm, max=1.0)
+    z = v * scale
+
+    return z, e
+
+def g_block_update_diff(q: torch.Tensor,
+                        lambdaG: torch.Tensor | float,
+                        rhoG: torch.Tensor | float,
+                        tau: float = 1e-3,
+                        newton_iters: int = 25,
+                        eps: float = 1e-12) -> tuple[torch.Tensor, float]:
+    """
+    Differentiable solver for the G-block update (scalar Gmin = gamma).
+
+    Solves a smooth approximation of:
+        min_{g,gamma} -lambdaG*gamma + (rhoG/2)||g-q||^2   s.t. g >= gamma
+    via:
+        hinge(t)=max(0,t)  ~  tau*softplus(t/tau)
+
+    Returns:
+        g     : same shape as q
+        gamma : scalar tensor (broadcastable)
+
+    Notes:
+      - As tau -> 0, this approaches the exact solution, but gradients can become sharp.
+      - newton_iters is unrolled => differentiable w.r.t. q, lambdaG, rhoG.
+    """
+    if q.ndim < 1:
+        raise ValueError("q must be at least 1D")
+
+    device, dtype = q.device, q.dtype
+    lambdaG_t = torch.as_tensor(lambdaG, device=device, dtype=dtype)
+    rhoG_t = torch.as_tensor(rhoG, device=device, dtype=dtype)
+
+    # target = lambdaG / rhoG (scalar)
+    target = lambdaG_t / (rhoG_t + eps)
+
+    # Smooth hinge: relu(t) ~ tau*softplus(t/tau)
+    # Define h(gamma) = sum_i tau*softplus((gamma - q_i)/tau) - target = 0
+    # h'(gamma) = sum_i sigmoid((gamma - q_i)/tau)
+    #
+    # Initialize gamma near max(q). If target>0, gamma will usually be >= max(q).
+    q_max = q.max()
+    # A mild upward bias helps Newton converge quickly in typical cases.
+    gamma = q_max + target / (q.numel() + eps)
+
+    for _ in range(newton_iters):
+        s = (gamma - q) / tau
+        hinge_smooth = tau * F.softplus(s)             # ~ max(0, gamma - q)
+        h = hinge_smooth.sum() - target
+
+        dh = torch.sigmoid(s).sum() / (1.0 + 0.0)      # derivative wrt gamma
+        dh = dh.clamp_min(eps)
+
+        gamma = gamma - h / dh
+
+    # Smooth max: max(q, gamma) ~ q + tau*softplus((gamma - q)/tau)
+    g = q + tau * F.softplus((gamma - q) / tau)
+
+    return g, gamma
+
+@torch.no_grad()
+def g_block_update_exact(q: torch.Tensor,
+                         lambdaG: float | torch.Tensor,
+                         rhoG: float | torch.Tensor,
+                         eps: float = 1e-12) -> tuple[torch.Tensor, float]:
+    """
+    Exact (non-differentiable) solver for the G-block update with scalar Gmin = gamma.
+
+    Solves:
+        min_{g,gamma} -lambdaG*gamma + (rhoG/2)||g-q||^2  s.t. g >= gamma
+
+    Returns:
+        g     : same shape as q
+        gamma : scalar tensor (same dtype/device)
+
+    Notes:
+        - Uses the closed-form sort + prefix-sum method.
+        - Marked @torch.no_grad() since it's intended non-differentiable.
+        - Works for any q shape; treats q as a flat vector of constraints.
+    """
+    if q.numel() == 0:
+        raise ValueError("q must be non-empty")
+
+    device, dtype = q.device, q.dtype
+    lam = torch.as_tensor(lambdaG, device=device, dtype=dtype)
+    rho = torch.as_tensor(rhoG, device=device, dtype=dtype)
+    target = lam / (rho + eps)  # lambdaG / rhoG
+
+    q_flat = q.reshape(-1)
+
+    # If target == 0, best is gamma = min(q)?? Let's see:
+    # Condition sum max(0, gamma - q_i) = 0 => gamma <= min(q).
+    # Objective prefers large gamma, so choose gamma = min(q).
+    if float(target.item()) <= 0.0:
+        gamma = q_flat.min()
+        g = torch.maximum(q, gamma)
+        return g, gamma
+
+    # Sort ascending: b_1 <= ... <= b_n
+    b, _ = torch.sort(q_flat)
+    n = b.numel()
+
+    # Prefix sums T_m = sum_{i=1}^m b_i
+    T = torch.cumsum(b, dim=0)
+
+    # Candidate gamma_m = (T_m + target) / m  (m is 1-indexed)
+    m = torch.arange(1, n + 1, device=device, dtype=dtype)
+    gamma_candidates = (T + target) / m
+
+    # We need b_m <= gamma_m <= b_{m+1}, with b_{n+1}=+inf
+    # Create b_{m+1} by shifting left and appending +inf
+    b_next = torch.empty_like(b)
+    b_next[:-1] = b[1:]
+    b_next[-1] = torch.tensor(float("inf"), device=device, dtype=dtype)
+
+    valid = (gamma_candidates >= b) & (gamma_candidates <= b_next)
+
+    if valid.any():
+        # pick the first valid m (smallest m) — it's the correct interval
+        idx = torch.nonzero(valid, as_tuple=False)[0, 0]
+        gamma = gamma_candidates[idx]
+    else:
+        # Numerical fallback: if no interval matched due to precision,
+        # clamp to [b_1, +inf) using the last candidate.
+        gamma = gamma_candidates[-1].clamp_min(b[0])
+
+    # g = max(q, gamma)
+    gamma_b = gamma.reshape(*([1] * q.ndim))  # broadcast scalar to q
+    g = torch.maximum(q, gamma_b)
+
+    return g, gamma
+
+@torch.no_grad()
+def g_block_update_band_exact(q: torch.Tensor,
+                              lambdaG: float | torch.Tensor,
+                              rhoG: float | torch.Tensor,
+                              linearity_pcnt: float,
+                              gamma_min: float | None = None,   # e.g. 0.0 if you need Gmin >= 0
+                              max_iters: int = 80,
+                              tol: float = 1e-10) -> tuple[torch.Tensor, float]:
+    """
+    Exact (non-differentiable) G-block update for constraint:
+        gamma <= g <= (1+linearity_pcnt)*gamma,  where g = Gx
+
+    Solves:
+        min_{g,gamma} -lambdaG*gamma + (rhoG/2)||g-q||^2
+        s.t. gamma <= g_i <= (1+linearity_pcnt)*gamma  (for all i)
+
+    Returns:
+        g     : same shape as q
+        gamma : scalar tensor
+    """
+    if linearity_pcnt < -1.0:
+        raise ValueError("Need 1+linearity_pcnt >= 0 for convex 'band' constraint.")
+    if q.numel() == 0:
+        raise ValueError("q must be non-empty.")
+
+    device, dtype = q.device, q.dtype
+    lam = torch.as_tensor(lambdaG, device=device, dtype=dtype)
+    rho = torch.as_tensor(rhoG, device=device, dtype=dtype)
+    a = torch.as_tensor(1.0 + linearity_pcnt, device=device, dtype=dtype)
+
+    qf = q.reshape(-1)
+
+    # derivative of f(gamma):
+    # f(gamma) = -lam*gamma + (rho/2) sum_i (clip(q_i, [gamma, a*gamma]) - q_i)^2
+    #
+    # Let I_low = {i: q_i < gamma} -> clip = gamma -> contrib (gamma-q_i)^2
+    # Let I_hi  = {i: q_i > a*gamma} -> clip = a*gamma -> contrib (a*gamma-q_i)^2
+    #
+    # f'(gamma) = -lam + rho * [ sum_{i in I_low} (gamma - q_i) + a * sum_{i in I_hi} (a*gamma - q_i) ]
+    #
+    def fprime(gamma: torch.Tensor) -> torch.Tensor:
+        low = qf < gamma
+        hi = qf > a * gamma
+        # sums over selected sets
+        term_low = (gamma - qf[low]).sum()
+        term_hi = (a * gamma - qf[hi]).sum()
+        return -lam + rho * (term_low + a * term_hi)
+
+    # Choose a bracket [lo, hi] with f'(lo) <= 0 <= f'(hi)
+    # f' is monotone increasing (convex 1D), so bisection works.
+    #
+    # A safe starting point is around min/max of q scaled.
+    qmin = qf.min()
+    qmax = qf.max()
+
+    # Initial bracket heuristics:
+    # For very small gamma, many points are in "hi" (if a*gamma << q), making f'(gamma) very negative.
+    # For very large gamma, many are in "low", making f'(gamma) very positive.
+    lo = qmin / a - (qmax - qmin + 1.0)  # conservative
+    hi = qmax + (qmax - qmin + 1.0)
+
+    if gamma_min is not None:
+        lo = torch.maximum(torch.as_tensor(gamma_min, device=device, dtype=dtype), torch.as_tensor(lo, device=device, dtype=dtype))
+    else:
+        lo = torch.as_tensor(lo, device=device, dtype=dtype)
+
+    hi = torch.as_tensor(hi, device=device, dtype=dtype)
+
+    f_lo = fprime(lo)
+    f_hi = fprime(hi)
+
+    # Expand bracket if needed (rare but possible with extreme values)
+    expand = 0
+    while f_lo > 0 and expand < 50:
+        # move lo downward
+        hi = lo
+        lo = lo - 2.0 * (torch.abs(lo) + 1.0)
+        if gamma_min is not None:
+            lo = torch.maximum(lo, torch.as_tensor(gamma_min, device=device, dtype=dtype))
+        f_lo = fprime(lo)
+        expand += 1
+
+    expand = 0
+    while f_hi < 0 and expand < 50:
+        # move hi upward
+        lo = hi
+        hi = hi + 2.0 * (torch.abs(hi) + 1.0)
+        f_hi = fprime(hi)
+        expand += 1
+
+    # Bisection
+    for _ in range(max_iters):
+        mid = 0.5 * (lo + hi)
+        f_mid = fprime(mid)
+
+        # Stop if derivative near zero or interval small
+        if torch.abs(f_mid) < tol or torch.abs(hi - lo) < tol:
+            gamma = mid
+            break
+
+        if f_mid > 0:
+            hi = mid
+        else:
+            lo = mid
+    else:
+        gamma = 0.5 * (lo + hi)
+
+    # Apply optional gamma_min
+    if gamma_min is not None:
+        gamma = torch.maximum(gamma, torch.as_tensor(gamma_min, device=device, dtype=dtype))
+
+    # g = clip(q, [gamma, a*gamma]) elementwise
+    g = torch.clamp(q, min=gamma.item(), max=(a * gamma).item())
+
+    return g, gamma
+
+def admm_general(G: torch.Tensor,
+                 L: torch.Tensor,
+                 E: torch.Tensor,
+                 C: Optional[torch.Tensor] = None,
+                 d: Optional[torch.Tensor] = None,
+                 lamdaG: Optional[float] = None,
+                 Gmin: Optional[float] = None,
+                 lamdaL: Optional[float] = None,
+                 Lmax: Optional[float] = None,
+                 lamdaE: Optional[float] = None,
+                 Emax: Optional[float] = None,
+                 linearity_pcnt: Optional[float] = None,
+                 state_dict: Optional[dict] = None,
+                 rho: float = 1e-2,
+                 admm_iters: int = 200,
+                 rho_adapt: bool = False,
+                 log_data: bool = True,
+                 verbose: bool = True) -> dict:
+    f"""
+    Solves:
+    min_(x, Gmin, Lmax, Emax) lamda_G * Gmin + lamda_L * Lmax + lamda_E * Emax
+    s.t. Gmin <= Gx
+         ||Lx||_2^2 <= Lmax
+         ||E_k x||_2 <= Emax for k=1...K
+         |Cx| <= d
+         
+    if linearity_pcnt is given, then:
+    Gmin <= Gx <= (1 + linearity_pcnt) * Gmin.
+         
+    Args
+    ----
+    G : torch.Tensor
+        tensor with shape (M, N)
+    L : torch.Tensor
+        tensor with shape (N, N)
+    E : torch.Tensor
+        tensor with shape (K, D, N)
+    C : torch.Tensor, optional
+        tensor with shape (Mc, N)
+    d : torch.Tensor, optional
+        tensor with shape (Mc,)
+    lamdaG : float, optional
+        Regularization parameter for the G constraint.
+    Gmin : float, optional
+        Minimum value for G.
+    lamdaL : float, optional
+        Regularization parameter for the L constraint.
+    Lmax : float, optional
+        Maximum value for L.
+    lamdaE : float, optional
+        Regularization parameter for the E constraint.
+    Emax : float, optional
+        Maximum value for E.
+    linearity_pcnt : float, optional
+        Percentage of linearity for the G constraint.
+    state_dict : dict, optional
+        Dictionary containing initial values for:
+        - 'sG': torch.Tensor of shape (N,), slack for G
+        - 'dG': torch.Tensor of shape (N,), dual  for G
+        - 'sL': torch.Tensor of shape (N,), slack for L
+        - 'dL': torch.Tensor of shape (N,), dual  for L
+        - 'sE': torch.Tensor of shape (K,), slack for E
+        - 'dE': torch.Tensor of shape (K,), dual  for E
+        - 'rhoG': float, penalty for G
+        - 'rhoL': float, penalty for L
+        - 'rhoE': float, penalty for E
+    rho : float, optional
+        Initial ADMM penalty parameter.
+    admm_iters : int, optional
+        Number of ADMM iterations.
+    rho_adapt : bool, optional
+        Whether to use rho adaptation.
+    log_data : bool, optional
+        Whether to log residuals and objective values.
+    verbose : bool, optional
+        Whether to display progress bars.
+        
+    Returns
+    -------
+    dict
+        A dictionary containing:
+        - 'x': The optimized variable x with shape (N,).
+        - 'r_pri': List of primal residual norms over iterations.
+        - 's_dual': List of dual residual norms over iterations.
+        - 'loss': List of objective values (t) over iterations.
+        + all updated state_dict variables
+    """
+    # Consts
+    K, D, N = E.shape
+    M = G.shape[0]
+    assert L.shape[0] == L.shape[1] == N
+    torch_dev = G.device
+    
+    # Make sure either a lamda or a variable is provided, but not both or neither
+    assert (lamdaG is not None and Gmin is None) or (lamdaG is None and Gmin is not None), \
+    "Either a lamda or a variable must be provided for G."
+    assert (lamdaL is not None and Lmax is None) or (lamdaL is None and Lmax is not None), \
+    "Either a lamda or a variable must be provided for L."
+    assert (lamdaE is not None and Emax is None) or (lamdaE is None and Emax is not None), \
+    "Either a lamda or a variable must be provided for E."
+    
+    # Default C, d if not provided
+    if C is None:
+        C = torch.zeros((1, N), device=torch_dev)
+    if d is None:
+        d = torch.ones((1,), device=torch_dev)
+    Mc = C.shape[0]
+    
+    # G Update rule depending on if a lamda or a variable is provided
+    if lamdaG is None:
+        if linearity_pcnt is None:
+            update_G = lambda q, rhoG: torch.clamp(q, min=Gmin)
+        else:
+            update_G = lambda q, rhoG: torch.clamp(q, min=Gmin, max=(1 + linearity_pcnt) * Gmin)
+    else:
+        if linearity_pcnt is None:
+            update_G = lambda q, rhoG: g_block_update_exact(q, lamdaG, rhoG)
+        else:
+            update_G = lambda q, rhoG: g_block_update_band_exact(q, lamdaG, rhoG, linearity_pcnt)
+            
+    # L Update rule depending on if a lamda or a variable is provided
+    if lamdaL is None:
+         def update_L(qL, rhoL):
+            Lmax_new = Lmax
+            slack_new = proj_l2_ball(qL[None,], Lmax_new ** 0.5)[0]
+            return slack_new, Lmax_new
+    else:
+        def update_L(qL, rhoL):
+            slack_new = qL * rhoL / (rhoL + 2 * lamdaL)
+            Lmax_new = slack_new.norm() ** 2
+            return slack_new, Lmax_new
+        
+    # E Update rule depending on if a lamda or a variable is provided
+    if lamdaE is None:
+        def update_E(qE, rhoE):
+            Emax_new = Emax
+            slack_new = proj_l2_ball(qE, Emax_new)
+            return slack_new, Emax_new
+    else:
+        def update_E(qE, rhoE):
+            slack_new, Emax_new = solve_epigraph_group_l2(qE, rhoE/2/lamdaE, max_iter=20)
+            return slack_new, Emax_new
+    
+    # Initialize variables if they are not provided in state_dict
+    if state_dict is None:
+        state_dict = {}
+    sE = state_dict.get('sE', torch.zeros((K, D), device=torch_dev))
+    dE = state_dict.get('dE', torch.zeros((K, D), device=torch_dev))
+    sG = state_dict.get('sG', torch.zeros((M,), device=torch_dev))
+    dG = state_dict.get('dG', torch.zeros((M,), device=torch_dev))
+    sL = state_dict.get('sL', torch.zeros((N,), device=torch_dev))
+    dL = state_dict.get('dL', torch.zeros((N,), device=torch_dev))
+    sC = state_dict.get('sC', torch.zeros((Mc,), device=torch_dev))
+    dC = state_dict.get('dC', torch.zeros((Mc,), device=torch_dev))
+    rhoE = state_dict.get('rhoE', rho)
+    rhoG = state_dict.get('rhoG', rho)
+    rhoL = state_dict.get('rhoL', rho)
+    rhoC = state_dict.get('rhoC', rho)
+    Estack = rearrange(E, 'K D N -> (K D) N')  # (K*D, N)
+    stability_I = lamda_stability * torch.eye(N, device=torch_dev)  # for numerical stability in x-update
+    
+    # Track diagnostics
+    dct = state_dict
+    if 'r_pri' not in dct and log_data:
+        dct['r_pri'] = []
+    if 's_dual' not in dct and log_data:
+        dct['s_dual'] = []
+    if 'Em' not in dct and log_data:
+        dct['Gmin'] = []
+    if 'Lmax' not in dct and log_data:
+        dct['Lmax'] = []
+    if 'Emax' not in dct and log_data:
+        dct['Emax'] = []
+        
+    # ADMM iterations
+    for i in tqdm(range(admm_iters), desc='ADMM iterations', disable=not verbose):
+        
+        # x-update
+        big_A = rhoE * (Estack.T @ Estack) + \
+                rhoG * (G.T @ G) + \
+                rhoL * (L.T @ L) + \
+                rhoC * (C.T @ C) + \
+                stability_I
+        big_B = rhoE * Estack.T @ rearrange(sE - dE, 'K D -> (K D)') + \
+                rhoG * (G.T @ (sG - dG)) + \
+                rhoL * (L.T @ (sL - dL)) + \
+                rhoC * (C.T @ (sC - dC))
+        x_new = torch.linalg.solve(big_A, big_B)
+        
+        # G slack updates
+        qG = G @ x_new + dG
+        sG_new, Gmin_new = update_G(qG, rhoG)
+        
+        # L slack updates
+        qL = L @ x_new + dL
+        sL_new, Lmax_new = update_L(qL, rhoL)
+        
+        # E slack updates
+        qE = E @ x_new + dE
+        sE_new, Emax_new = update_E(qE, rhoE)
+        
+        # C slack updates
+        qC = C @ x_new + dC
+        sC_new = torch.clamp(qC, min=-d, max=d)
+        
+        # Primal Residual
+        rpG = G @ x_new - sG_new
+        rpL = L @ x_new - sL_new
+        rpE = E @ x_new - sE_new
+        rpC = C @ x_new - sC_new
+        
+        # Dual Residual
+        if log_data:
+            rdG = rhoG * G.T @ (sG_new - sG)
+            rdL = rhoL * L.T @ (sL_new - sL)
+            rdE = rhoE * Estack.T @ (rearrange(sE_new - sE, 'K D -> (K D)'))
+            rdC = rhoC * C.T @ (sC_new - sC)
+        
+        # Dual updates
+        dG = dG + rpG
+        dL = dL + rpL
+        dE = dE + rpE
+        dC = dC + rpC
+        
+        # Update variables
+        x = x_new
+        Gmin = Gmin_new
+        Lmax = Lmax_new
+        Emax = Emax_new
+        sG = sG_new
+        sL = sL_new
+        sE = sE_new
+        sC = sC_new
+        
+        # Rho adapt
+        if i % 10 == 0 and rho_adapt:
+            rhoG, dG = boyd_update(rpG.norm(), rdG.norm(), rhoG, dG)
+            rhoL, dL = boyd_update(rpL.norm(), rdL.norm(), rhoL, dL)
+            rhoE, dE = boyd_update(rpE.norm(), rdE.norm(), rhoE, dE)
+            rhoC, dC = boyd_update(rpC.norm(), rdC.norm(), rhoC, dC)
+        
+        # Diagnostics
+        if log_data:
+            r_norm = torch.sqrt(rpG.norm()**2 + rpL.norm()**2 + rpE.norm()**2 + rpC.norm()**2).item()
+            s_norm = torch.sqrt(rdG.norm()**2 + rdL.norm()**2 + rdE.norm()**2 + rdC.norm()**2).item()
+            dct['r_pri'].append(r_norm)
+            dct['s_dual'].append(s_norm)
+            dct['Gmin'].append(Gmin_new)
+            dct['Lmax'].append(Lmax_new)
+            dct['Emax'].append(Emax_new)
+            if verbose and i % 50 == 0:
+                print(f"Iter {i}, ||r||={r_norm:.4e}, ||s||={s_norm:.4e}")
+            
+    dct['x'] = x
+    dct['sG'] = sG
+    dct['dG'] = dG
+    dct['rhoG'] = rhoG
+    dct['sL'] = sL
+    dct['dL'] = dL
+    dct['rhoL'] = rhoL
+    dct['sE'] = sE
+    dct['dE'] = dE
+    dct['rhoE'] = rhoE
+    dct['sC'] = sC
+    dct['dC'] = dC
+    dct['rhoC'] = rhoC
+    return dct
+    
 def admm_min_quadratic_peak_norm_constraint(L: torch.Tensor,
                                             A: torch.Tensor,
                                             T: torch.Tensor,
