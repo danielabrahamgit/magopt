@@ -2,6 +2,7 @@ import torch
 
 from tqdm import tqdm
 from typing import Optional
+from einops import einsum
 
 from .elip import EllipELookup, EllipKLookup
 
@@ -41,7 +42,7 @@ def _transform_coordinates(crds: torch.Tensor,
     
     # First construct an arbitrary rotation matrix that maps the z-axis to 'normal's
     basis_vec = torch.zeros_like(crds)
-    basis_vec[..., 0] = 1.0
+    basis_vec[..., 1] = 1.0
     # if (basis_vec @ normal).abs() > 0.999:
     #     basis_vec = torch.tensor([0, 1, 0], device=crds.device, dtype=crds.dtype)
     xp = torch.cross(basis_vec, normal, dim=-1)
@@ -55,7 +56,7 @@ def _transform_coordinates(crds: torch.Tensor,
         transformed_crds = (crds[..., None] * Rot.mT).sum(dim=-2) + center
     else:
         transformed_crds = ((crds - center)[..., None] * Rot).sum(dim=-2)
-    return transformed_crds
+    return transformed_crds, Rot
 
 def calc_mag_potential_loop(spatial_crds: torch.Tensor, 
                             R: float,
@@ -84,7 +85,7 @@ def calc_mag_potential_loop(spatial_crds: torch.Tensor,
         The magnetic potential with shape (..., 3) in units [T*m]
     """
     # Transform coordinates
-    spatial_crds = _transform_coordinates(spatial_crds, center, normal)
+    spatial_crds, Rot = _transform_coordinates(spatial_crds, center, normal)
     
     # Convert to cylindrical coordinates
     rho = (spatial_crds[..., 0] ** 2 + spatial_crds[..., 1] ** 2 + EPSILON_STABILITY).sqrt()
@@ -103,6 +104,9 @@ def calc_mag_potential_loop(spatial_crds: torch.Tensor,
     # Convert to cartesian coordinates
     azimuthal_vec = torch.stack((-spatial_crds[..., 1], spatial_crds[..., 0], torch.zeros_like(spatial_crds[..., 0])), dim=-1)
     A = A_azimuthal[..., None] * azimuthal_vec / rho[..., None]
+    
+    # Rotate fields
+    A = (A[..., None] * Rot.mT).sum(dim=-2)
 
     return A
 
@@ -133,7 +137,7 @@ def calc_bfield_loop(spatial_crds: torch.Tensor,
         The magnetic field with shape (..., 3) in units [T]
     """
     # Transform coordinates
-    spatial_crds = _transform_coordinates(spatial_crds, center, normal)
+    spatial_crds, Rot = _transform_coordinates(spatial_crds, center, normal)    
     
     # Convert to cylindrical coordinates
     rho = (spatial_crds[..., 0] ** 2 + spatial_crds[..., 1] ** 2).sqrt()
@@ -163,6 +167,9 @@ def calc_bfield_loop(spatial_crds: torch.Tensor,
     # Convert Bfield to cartesian coordinates
     bfield = B_rho[..., None] * rho_hat + \
              B_z[..., None] * z_hat
+             
+    # Rotate fields
+    bfield = (bfield[..., None] * Rot.mT).sum(dim=-2)
              
     return bfield
 
@@ -279,7 +286,7 @@ def calc_bfield_loop_jacobian(
     Much thanks to Chat-GPT 5o!
     """
     # Transform coordinates
-    spatial_crds = _transform_coordinates(spatial_crds, center, normal)
+    spatial_crds, Rot = _transform_coordinates(spatial_crds, center, normal)
 
     if ellipe is None or ellipk is None:
         raise ValueError("Provide elliptic integral modules ellipe and ellipk.")
@@ -385,5 +392,8 @@ def calc_bfield_loop_jacobian(
         torch.stack([Jyx, Jyy, Jyz], dim=-1),
         torch.stack([Jzx, Jzy, Jzz], dim=-1),
     ], dim=-2)
+    
+    # Rotate Jacobian
+    J = Rot @ J @ Rot.mT
 
     return J

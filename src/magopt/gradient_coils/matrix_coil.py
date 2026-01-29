@@ -30,9 +30,9 @@ class matrix_coil(gradient_coil):
         thetas_phis : torch.Tensor
             shape (N, 2) representing the phi and theta angles of the coil loops.
         """
-        self.radii = radii
-        self.centers = centers
-        self.thetas_phis = thetas_phis
+        self.radii = torch.nn.Parameter(radii, requires_grad=False)
+        self.centers = torch.nn.Parameter(centers, requires_grad=False)
+        self.thetas_phis = torch.nn.Parameter(thetas_phis, requires_grad=False)
         self.elip_e = EllipELookup().to(radii.device)
         self.elip_k = EllipKLookup().to(radii.device)
     
@@ -75,11 +75,12 @@ class matrix_coil(gradient_coil):
         # Convert phis_thetas to normal vectors
         normals = self._get_normals()
         
+        analytic = True
         # Parametric wire method
-        if True:
+        if not analytic:
             
             # Gen base loop coordinates
-            thetas = torch.linspace(0, 2 * torch.pi, 100, 
+            thetas = torch.linspace(0, 2 * torch.pi, 1000, 
                                     device=self.radii.device)
             xs = torch.cos(thetas)
             ys = torch.sin(thetas)
@@ -90,7 +91,7 @@ class matrix_coil(gradient_coil):
             crds_loop_new = _transform_coordinates(self.radii[:, None, None] * crds_loop[None, :, :], 
                                                    self.centers[:, None, :], 
                                                    normals[:, None, :],
-                                                   flip_order=True)
+                                                   flip_order=True)[0]
             
             # Compute fields per loop 
             bfields = []
@@ -199,17 +200,22 @@ class matrix_coil(gradient_coil):
             crds_loop_new = _transform_coordinates(r * crds_loop, 
                                                    c[None, :], 
                                                    n[None, :],
-                                                   flip_order=True).cpu()
+                                                   flip_order=True)[0].cpu() * 1e2
             
             # Use RDBu_R colormap for current values
             # -1 --> blue, 0 ---> white, 1 --> red
-            # colors = plt.get_cmap('RdBu_r')((vals[i] + 1) / 2) 
-            colors = 'black'
+            colors = plt.get_cmap('RdBu_r')((vals[i] + 1) / 2) 
+            # colors = 'black'
             
             # Plot
-            ax.plot(crds_loop_new[..., 0], crds_loop_new[..., 1], crds_loop_new[..., 2], color=colors)
+            ax.plot(crds_loop_new[..., 0], 
+                    crds_loop_new[..., 1], 
+                    crds_loop_new[..., 2], color=colors)
             
         ax.axis('equal')
+        ax.set_xlabel('X (cm)')
+        ax.set_ylabel('Y (cm)')
+        ax.set_zlabel('Z (cm)')
         
         # Show loop coefficients
         fig = plt.figure()
