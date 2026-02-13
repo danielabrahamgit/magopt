@@ -15,7 +15,7 @@ Simulation and optimization of magnetic fields for MRI gradient coil design.
 ### Using Conda (recommended)
 
 ```bash
-git clone https://github.com/your-username/magopt.git
+git clone https://github.com/danielabrahamgit/magopt
 cd magopt
 conda env create -f environment.yml
 conda activate magopt
@@ -25,7 +25,7 @@ pip install -e .
 ### Using pip
 
 ```bash
-git clone https://github.com/your-username/magopt.git
+git clone https://github.com/danielabrahamgit/magopt
 cd magopt
 pip install -e .
 ```
