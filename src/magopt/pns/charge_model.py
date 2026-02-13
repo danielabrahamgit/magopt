@@ -7,7 +7,7 @@ from einops import einsum
 from matplotlib import cm
 from typing import Optional
 
-from body_model import (
+from .adult_model import (
     uv_to_xyz, 
     uv_to_normals, 
     dxyz_duv

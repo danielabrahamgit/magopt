@@ -12,6 +12,7 @@ from magopt.sim.elip import EllipELookup, EllipKLookup
 
 
 # Crds to sample field at 
+torch.manual_seed(42)
 torch_dev = torch.device(5)
 im_size = (51, 51, 3)
 fov = (0.22,)*3
@@ -26,7 +27,7 @@ normals = torch.tensor([0, 1, 1], device=torch_dev, dtype=torch.float32)[None,:]
 normals /= normals.norm(dim=-1, keepdim=True)
 
 # Use biot savart law
-thetas = torch.linspace(0, 2 * torch.pi, 100, device=torch_dev)
+thetas = torch.linspace(0, 2 * torch.pi, 200, device=torch_dev)
 xs = torch.cos(thetas)
 ys = torch.sin(thetas)
 zs = torch.zeros_like(thetas)
@@ -56,8 +57,8 @@ for i in range(im_size[2]):
     axes = ['X', 'Y', 'Z']
     plt.suptitle(f'Z = {zslc:.2f} cm')
     for d in range(3):
-        vmin = bfield[..., i, d].median() - 3 * bfield[..., i, d].std()
-        vmax = bfield[..., i, d].median() + 3 * bfield[..., i, d].std()
+        vmin = bfield_analytic[..., i, d].median() - 3 * bfield_analytic[..., i, d].std()
+        vmax = bfield_analytic[..., i, d].median() + 3 * bfield_analytic[..., i, d].std()
         plt.subplot(2, 3, d+1)
         plt.imshow(bfield[..., i, d].cpu(), vmin=vmin, vmax=vmax, cmap='RdBu_r')
         plt.title(f'B-field {axes[d]}')

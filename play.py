@@ -6,13 +6,10 @@ matplotlib.use('WebAgg')
 import matplotlib.pyplot as plt
 
 from magopt.gradient_coils import matrix_coil, circular_z_coil, elliptical_frustum
-from mr_recon.utils import gen_grd
+from magopt.utils import gen_grd
 from magopt.sim.analytic import calc_bfield_loop 
 from magopt.sim.elip import EllipELookup, EllipKLookup
 from magopt.optim_admm import (
-    admm_min_peak_norm_plus_quadtratic, 
-    admm_min_quadratic, 
-    admm_min_peak_norm,
     admm_general,
     unrolled_admm_general,
 )
@@ -56,7 +53,7 @@ Zbody = 0.2 # m (height of body)
 Rsurface = 0.13 # m (radius of surface)
 Zsurface = 0.2 # m (height of surface)s
 dsv = 0.16 # Diameter of spherical volume to optimize over
-im_size = (51, 51, 51) 
+im_size = (221, 221, 3) 
 grad_dir = 1 # 0 --> x, 1 --> y, 2 --> z
 d = len(im_size)
 Nrad = 6
@@ -176,6 +173,11 @@ plt.legend()
 
 # Show Coil
 fig, ax, axl = grad_coil.show_design(coeffs=dct['x'])
+
+amax = dct['x'].abs().argmax()
+val = dct['x'][amax].item()
+dct['x'] *= 0
+dct['x'][1] = val / 2
 
 # Show fields
 G, B, E = grad_coil.build_field_matrices(crds_gfield=crds_flt, crds_bfield=crds_flt, crds_efield=crds_flt)

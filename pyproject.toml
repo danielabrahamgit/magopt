@@ -19,10 +19,11 @@ dependencies = [
     "numpy",
     "scipy",
     "tqdm",
+    "einops",
+    "matplotlib",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
-    "matplotlib",
 ]
