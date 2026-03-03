@@ -1,3 +1,6 @@
+from pathlib import Path
+import sys
+
 import torch
 import numpy as np
 
@@ -5,17 +8,24 @@ import matplotlib
 matplotlib.use('WebAgg')
 import matplotlib.pyplot as plt
 
+REPO_ROOT = Path(__file__).resolve().parent
+MAGOPT_SRC_ROOT = REPO_ROOT / 'src'
+MR_RECON_SRC_ROOT = REPO_ROOT.parent / 'mr_recon' / 'src'
+for path in (MAGOPT_SRC_ROOT, MR_RECON_SRC_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
 from magopt.gradient_coils import matrix_coil, circular_z_coil, elliptical_frustum
-from magopt.utils import gen_grd
-from magopt.sim.analytic import calc_bfield_loop 
-from magopt.sim.elip import EllipELookup, EllipKLookup
+from mr_recon.utils import gen_grd
+from magopt.sim.physics.circle.analytic_loop import calc_bfield_loop
+from magopt.sim.numerics.elliptic_lookup import EllipELookup, EllipKLookup
 from magopt.optim_admm import (
     admm_general,
     unrolled_admm_general,
 )
 from einops import einsum
 
-# Generate points on surface
+# Generate points on unit surface
 def gen_pts_sphere(N):
     pts = []
     N_count = 0

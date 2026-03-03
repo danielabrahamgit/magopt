@@ -2,11 +2,10 @@ import torch
 
 from tqdm import tqdm
 from typing import Optional
-from einops import einsum
 
-from .core.elip import EllipELookup, EllipKLookup
 
-from .core.constants import MU0, EPSILON_STABILITY
+from ...numerics.elliptic_lookup import EllipELookup, EllipKLookup
+from ...core.constants import MU0, EPSILON_STABILITY
 
 def _transform_coordinates(crds: torch.Tensor,
                            center: torch.Tensor,

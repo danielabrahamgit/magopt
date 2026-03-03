@@ -9,7 +9,7 @@ from einops import rearrange, einsum
 
 from .gradient_coil import gradient_coil
 from ..bspline import BSpline1D
-from ..sim.elip import EllipELookup, EllipKLookup
+from ..sim.core.elip import EllipELookup, EllipKLookup
 from ..sim.analytic import (
     calc_bfield_loop_jacobian, 
     calc_bfield_loop,

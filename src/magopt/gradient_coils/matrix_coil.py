@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from typing import Optional
 from einops import rearrange
 from .gradient_coil import gradient_coil
-from ..sim.elip import EllipELookup, EllipKLookup
+from ..sim.core.elip import EllipELookup, EllipKLookup
 from ..sim import parametric_wire
 from ..sim.analytic import (
     calc_bfield_loop_jacobian, 

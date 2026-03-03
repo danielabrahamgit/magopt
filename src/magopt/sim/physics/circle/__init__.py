@@ -1,6 +1,4 @@
-from .physics.filament.wire_model import parametric_wire, elliptical_wire
-
-from .physics.circle.analytic_loop import (
+from .analytic_loop import (
     _transform_coordinates,
     calc_mag_potential_loop,
     calc_bfield_loop,
