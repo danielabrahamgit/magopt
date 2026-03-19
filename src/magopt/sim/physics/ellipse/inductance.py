@@ -2,8 +2,9 @@ import torch
 from typing import Optional, Tuple
 import warnings
 
-from ..filament.inductance_kernels import _gauss_legendre, _tanh_sinh
+from ...numerics.quadrature import _gauss_legendre, _tanh_sinh
 from ..filament.inductance_kernels import base_inductance
+from ...core.constants import MU0, EPSILON_STABILITY
 
 
 

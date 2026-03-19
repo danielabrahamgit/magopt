@@ -6,7 +6,7 @@ import warnings
 
 from ...core.constants import MU0, EPSILON_STABILITY
 
-from ..filament.inductance_kernels import _gauss_legendre, _tanh_sinh
+from ...numerics.quadrature import _gauss_legendre, _tanh_sinh
 
 
 class base_inductance:
