@@ -1,5 +1,7 @@
 # Magopt
 
+Document exists in EE292L\_DA\_MB.pdf
+Pres exists in EE292L Final.pdf
 Simulation and optimization of magnetic fields for MRI gradient coil design.
 
 ## Features
