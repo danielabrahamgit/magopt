@@ -4,20 +4,13 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from typing import Optional
 
-try:
-    from .base_inductance import base_inductance
-    from .base_bfield     import base_bfield
-except ImportError:
-    from base_inductance import base_inductance
-    from base_bfield     import base_bfield
+from .inductance_kernels import base_inductance
+from .bfield_kernels     import base_bfield
 
 # Optional: analytic/parametric ellipse kernels (full-loop Gauss quadrature)
-try:
-    from .elliptical_bfield import elliptical_bfield as _elliptical_bfield_kernel
-except ImportError:
-    from elliptical_bfield import elliptical_bfield as _elliptical_bfield_kernel
-
-from .core.constants import MU0, EPSILON_STABILITY
+from ..filament.inductance_kernels import _gauss_legendre, _tanh_sinh
+from ..ellipse.bfield import elliptical_bfield as _elliptical_bfield_kernel
+from ...core.constants import MU0, EPSILON_STABILITY
 
 class parametric_wire(base_inductance, base_bfield):
     """

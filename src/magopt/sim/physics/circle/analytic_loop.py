@@ -2,15 +2,14 @@ import torch
 
 from tqdm import tqdm
 from typing import Optional
-from einops import einsum
 
-from .core.elip import EllipELookup, EllipKLookup
 
-from .core.constants import MU0, EPSILON_STABILITY
+from ...numerics.elliptic_lookup import EllipELookup, EllipKLookup
+from ...core.constants import MU0, EPSILON_STABILITY
 
 def _transform_coordinates(crds: torch.Tensor,
-                           center: torch.Tensor,
-                           normal: torch.Tensor,
+                           center: Optional[torch.Tensor],
+                           normal: Optional[torch.Tensor],
                            flip_order: bool = False) -> torch.Tensor:
     """
     Rotates the spatial coordinates the z-axis maps to 'normal',
@@ -32,12 +31,23 @@ def _transform_coordinates(crds: torch.Tensor,
     transformed_crds : torch.Tensor
         Transformed spatial coordinates with shape (..., 3) in units [m]
     """
+    if center is None:
+        center = torch.zeros(3, dtype=crds.dtype, device=crds.device)
+    else:
+        center = torch.as_tensor(center, dtype=crds.dtype, device=crds.device)
+
+    if normal is None:
+        normal = torch.tensor([0.0, 0.0, 1.0], dtype=crds.dtype, device=crds.device)
+    else:
+        normal = torch.as_tensor(normal, dtype=crds.dtype, device=crds.device)
+
+    if center.ndim == 1 and crds.ndim > 1:
+        center = center.view(*([1] * (crds.ndim - 1)), 3)
+    if normal.ndim == 1 and crds.ndim > 1:
+        normal = normal.view(*([1] * (crds.ndim - 1)), 3).expand_as(crds)
+
     # Check normal
     assert (normal.norm(dim=-1) - 1.0).abs().max() < 1e-5, "Normal vector must be a unit vector"
-    
-    # Move to same device
-    center = center.to(crds.device)
-    normal = normal.to(crds.device)
     
     # First construct an arbitrary rotation matrix that maps the z-axis to 'normal's
     basis_vec = torch.zeros_like(crds)
@@ -59,8 +69,8 @@ def _transform_coordinates(crds: torch.Tensor,
 
 def calc_mag_potential_loop(spatial_crds: torch.Tensor, 
                             R: float,
-                            center: Optional[torch.Tensor] = torch.zeros(3),
-                            normal: Optional[torch.Tensor] = torch.tensor([0, 0, 1]),
+                            center: Optional[torch.Tensor] = None,
+                            normal: Optional[torch.Tensor] = None,
                             ellipe: Optional[torch.nn.Module] = EllipELookup(),
                             ellipk: Optional[torch.nn.Module] = EllipKLookup()) -> torch.Tensor:
     """
@@ -111,8 +121,8 @@ def calc_mag_potential_loop(spatial_crds: torch.Tensor,
 
 def calc_bfield_loop(spatial_crds: torch.Tensor,
                      R: float,
-                     center: Optional[torch.Tensor] = torch.zeros(3),
-                     normal: Optional[torch.Tensor] = torch.tensor([0, 0, 1]),
+                     center: Optional[torch.Tensor] = None,
+                     normal: Optional[torch.Tensor] = None,
                      ellipe: Optional[torch.nn.Module] = EllipELookup(),
                      ellipk: Optional[torch.nn.Module] = EllipKLookup()) -> torch.Tensor:
     """
@@ -312,8 +322,8 @@ def _dEdm(m, K, E, eps=1e-12):
 def calc_bfield_loop_jacobian(
     spatial_crds: torch.Tensor,
     R: float,
-    center: Optional[torch.Tensor] = torch.zeros(3),
-    normal: Optional[torch.Tensor] = torch.tensor([0, 0, 1]),
+    center: Optional[torch.Tensor] = None,
+    normal: Optional[torch.Tensor] = None,
     ellipe: Optional[torch.nn.Module] = EllipELookup(),
     ellipk: Optional[torch.nn.Module] = EllipKLookup()) -> torch.Tensor:
     """
