@@ -72,7 +72,7 @@ class parametric_wire:
                         radius_wire: Optional[float] = 0.5e-3) -> float:
         """
         Calculates the inductance of the wire using the formula:
-        L = mu0 / 4pi * int_C1, int_C2 dx1 \cdot dx2 / |x1 - x2|
+        L = mu0 / 4pi * int_C1, int_C2 <dx1, dx2> / |x1 - x2|
         
         Args:
         -----
@@ -311,3 +311,4 @@ class parametric_wire:
         plt.axis('equal')
         
         return fig, ax
+    

@@ -2,12 +2,10 @@ import torch
 
 from tqdm import tqdm
 from typing import Optional
-from einops import einsum
 
-from .elliptic_lookup import EllipELookup, EllipKLookup
 
-MU0 = 4e-7 * torch.pi # T*m/A
-EPSILON_STABILITY = 1e-9 # Small value to avoid division by zero in calculations
+from ...elliptic_lookup import EllipELookup, EllipKLookup
+from ...constants import MU0, EPSILON_STABILITY
 
 def _transform_coordinates(crds: torch.Tensor,
                            center: torch.Tensor,
@@ -263,11 +261,49 @@ def calc_inductance_matrix(radii: torch.Tensor,
     return L
 
 def _dKdm(m, K, E, eps=1e-12):
+    """
+    Derivative of complete elliptic integral K with respect to m.
+
+    Args:
+    -----
+    m : torch.Tensor
+        Modulus parameter.
+    K : torch.Tensor
+        K(m) values.
+    E : torch.Tensor
+        E(m) values.
+    eps : float
+        Stability clamp for m.
+
+    Returns:
+    --------
+    torch.Tensor
+        dK/dm values.
+    """
     # dK/dm = (E/(m(1-m)) - K/m)/2
     m = m.clamp(eps, 1.0 - eps)
     return 0.5 * (E / (m * (1.0 - m)) - K / m)
 
 def _dEdm(m, K, E, eps=1e-12):
+    """
+    Derivative of complete elliptic integral E with respect to m.
+
+    Args:
+    -----
+    m : torch.Tensor
+        Modulus parameter.
+    K : torch.Tensor
+        K(m) values.
+    E : torch.Tensor
+        E(m) values.
+    eps : float
+        Stability clamp for m.
+
+    Returns:
+    --------
+    torch.Tensor
+        dE/dm values.
+    """
     # dE/dm = (E - K) / (2m)
     m = m.clamp(eps, 1.0 - eps)
     return 0.5 * (E - K) / m
@@ -284,6 +320,26 @@ def calc_bfield_loop_jacobian(
     Returns (..., 3, 3) with entries dB_i/dx_j in Cartesian coords.
     
     Much thanks to Chat-GPT 5o!
+
+    Args:
+    -----
+    spatial_crds : torch.Tensor
+        Evaluation coordinates with shape (..., 3).
+    R : float
+        Loop radius.
+    center : Optional[torch.Tensor]
+        Loop center.
+    normal : Optional[torch.Tensor]
+        Loop normal vector.
+    ellipe : Optional[torch.nn.Module]
+        Elliptic integral E evaluator.
+    ellipk : Optional[torch.nn.Module]
+        Elliptic integral K evaluator.
+
+    Returns:
+    --------
+    torch.Tensor
+        Jacobian tensor with shape (..., 3, 3).
     """
     # Transform coordinates
     spatial_crds, Rot = _transform_coordinates(spatial_crds, center, normal)
@@ -333,7 +389,7 @@ def calc_bfield_loop_jacobian(
     dE_drho = dE_dm * dm_drho
     dE_dz   = dE_dm * dm_dz
 
-    # C = MU0 / (2π √A)
+    # C = MU0 / (2pi sqrtA)
     C = MU0 / (2.0 * torch.pi * torch.sqrt(A))
     # dC = -(1/2) C * dA / A
     dC_drho = -0.5 * C * dA_drho / A
@@ -372,8 +428,8 @@ def calc_bfield_loop_jacobian(
     dBz_dz   = dC_dz   * U + C * dU_dz
 
     # Convert cylindrical partials to Cartesian Jacobian.
-    # Bx = B_rho cosφ; By = B_rho sinφ; Bz = B_z
-    # Using: ∂ρ/∂x = cosφ, ∂ρ/∂y = sinφ, ∂φ/∂x = -sinφ/ρ, ∂φ/∂y = cosφ/ρ
+    # Bx = B_rho cosphi; By = B_rho sinphi; Bz = B_z
+    # Using: drho/dx = cosphi, drho/dy = sinphi, dphi/dx = -sinphi/rho, dphi/dy = cosphi/rho
     # Results (compact, stable with inv_rho):
     Jxx = (cosphi * cosphi) * dBrho_drho + (B_rho * (sinphi * sinphi)) * inv_rho
     Jxy = (sinphi * cosphi) * (dBrho_drho - B_rho * inv_rho)

@@ -9,7 +9,8 @@ from einops import rearrange, einsum
 
 from .gradient_coil import gradient_coil
 from ..bspline import BSpline1D
-from ..sim.elip import EllipELookup, EllipKLookup
+# from ..sim.elip import EllipELookup, EllipKLookup
+from ..sim.elliptic_lookup import EllipELookup, EllipKLookup
 from ..sim.analytic import (
     calc_bfield_loop_jacobian, 
     calc_bfield_loop,
@@ -26,7 +27,8 @@ class circular_z_coil(gradient_coil):
                  lamda_spline: float = 1e-2,
                  M_fourier_modes: Optional[int] = 10,
                  K_maxwell: Optional[int] = None,
-                 max_fourier_cycles: int = 3,):
+                 max_fourier_cycles: int = 3,
+                 maxwell_pair: bool = False):
         """
         Args
         ----
@@ -103,6 +105,16 @@ class circular_z_coil(gradient_coil):
             # plt.show()
             # quit()
             
+        if maxwell_pair:
+            self.Imat = torch.zeros((self.N, 1), device=self.torch_dev, dtype=self.Imat.dtype)
+            radius = rs_spline.mean().item()
+            zs = self.get_coil_zs()
+            d = (3 ** 0.5) * radius
+            idx1 = torch.argmin((zs - d/2).abs())
+            idx2 = torch.argmin((zs + d/2).abs())
+            self.Imat[idx1, 0] = 1
+            self.Imat[idx2, 0] = -1
+            
             
         # Need to make these for fast elliptic integral lookup
         self.elip_e = EllipELookup().to(self.torch_dev)
@@ -154,12 +166,12 @@ class circular_z_coil(gradient_coil):
             
         Returns
         -------
+        bfields_mat : torch.Tensor
+            shape (Nb, Ncoeff, 3) mapping coil coefficients to magnetic fields Bx, By, Bz
         gfield_mat : torch.Tensor
-            shape (3, Ng, Ncoeff) mapping coil coefficients to gradient fields dBz/dx, dBz/dy, dBz/dz
-        bfield_mat : torch.Tensor
-            shape (3, Nb, Ncoeff) mapping coil coefficients to magnetic fields Bx, By, Bz
-        efield_mat : torch.Tensor
-            shape (3, Ne, Ncoeff) mapping coil coefficients to electric fields Ex, Ey, Ez
+            shape (Ng, Ncoeff, 3) mapping coil coefficients to gradient fields dBz/dx, dBz/dy, dBz/dz
+        efields_mat : torch.Tensor
+            shape (Ne, Ncoeff, 3) mapping coil coefficients to electric fields Ex, Ey, Ez
         """
         # Get coil geometry
         zs = self.get_coil_zs()
@@ -170,16 +182,19 @@ class circular_z_coil(gradient_coil):
         normals = torch.stack([zs*0, zs*0, zs*0 + 1], dim=-1)
         gfields_mat = calc_bfield_loop_jacobian(crds_gfield[:, None], rs[None,], centers[None,], normals[None,], self.elip_e, self.elip_k)[..., -1, :]
         gfields_mat = rearrange(gfields_mat, 'Nb N d -> d Nb N') @ self.Imat
+        gfields_mat = rearrange(gfields_mat, 'd M N -> M N d')
         
         # Compute magnetic fields
         bfields_mat = calc_bfield_loop(crds_bfield[:, None], rs[None,], centers[None,], normals[None,], self.elip_e, self.elip_k)
         bfields_mat = rearrange(bfields_mat, 'Nb N d -> d Nb N') @ self.Imat
+        bfields_mat = rearrange(bfields_mat, 'd M N -> M N d')
         
         # Compute magnetic potential
         afields_mat = calc_mag_potential_loop(crds_efield[:, None], rs[None,], centers[None,], normals[None,], self.elip_e, self.elip_k)
-        afields_mat = rearrange(afields_mat, 'Ne N d -> d Ne N') @ self.Imat        
+        afields_mat = rearrange(afields_mat, 'Ne N d -> d Ne N') @ self.Imat     
+        afields_mat = rearrange(afields_mat, 'd M N -> M N d')
 
-        return gfields_mat, bfields_mat, afields_mat
+        return bfields_mat, gfields_mat, -afields_mat # E = -A
 
     def evaluate_fields(self,
                         coeffs: torch.Tensor,

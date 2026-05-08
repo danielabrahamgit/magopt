@@ -4,11 +4,17 @@ import matplotlib
 matplotlib.use('WebAgg')
 import matplotlib.pyplot as plt
 
-from mr_recon.utils import gen_grd
+from tqdm import tqdm
+from magopt.utils import gen_grd
 from magopt.gradient_coils import matrix_coil
-from magopt.sim.analytic import calc_bfield_loop, _transform_coordinates
+from magopt.sim.analytic import (
+    calc_bfield_loop, 
+    calc_bfield_loop_jacobian,
+    _transform_coordinates,
+)
 from magopt.sim import parametric_wire
-from magopt.sim.elip import EllipELookup, EllipKLookup
+# from magopt.sim.elip import EllipELookup, EllipKLookup
+from magopt.sim.elliptic_lookup import EllipELookup, EllipKLookup
 
 
 # Crds to sample field at 
@@ -36,8 +42,9 @@ crds_loop_new = _transform_coordinates(crds_loop,
                                        centers[:, None, :], 
                                        normals[:, None, :],
                                        flip_order=True)[0]
-pw = parametric_wire(wire_pts=crds_loop_new[0])
+pw = parametric_wire(wire_pts=crds_loop_new[0], verbose=False)
 bfield = pw.calc_bfield(crds_flt).reshape((*im_size, 3)).cpu()
+gfield = pw.calc_bfield_jacobian(crds_flt)[..., -1, :].reshape((*im_size, 3)).cpu()
 
 # Use analytic formula
 ellipe = EllipELookup().to(torch_dev)
@@ -48,26 +55,33 @@ bfield_analytic = calc_bfield_loop(crds_flt[None, :, :],
                                    normals[:, None, :],
                                    ellipe=ellipe,
                                    ellipk=ellipk)[0].reshape((*im_size, 3)).cpu()
-
+gfield_analytic = calc_bfield_loop_jacobian(crds_flt[None, :, :], 
+                                   radii[:, None], 
+                                   centers[:, None, :], 
+                                   normals[:, None, :],
+                                   ellipe=ellipe,
+                                   ellipk=ellipk)[0, ..., -1, :].reshape((*im_size, 3)).cpu()
 
 # Show slices 
-for i in range(im_size[2]):
-    plt.figure(figsize=(12, 6))
-    zslc = crds[0, 0, i, 2].item() * 1e2
-    axes = ['X', 'Y', 'Z']
-    plt.suptitle(f'Z = {zslc:.2f} cm')
-    for d in range(3):
-        vmin = bfield_analytic[..., i, d].median() - 3 * bfield_analytic[..., i, d].std()
-        vmax = bfield_analytic[..., i, d].median() + 3 * bfield_analytic[..., i, d].std()
-        plt.subplot(2, 3, d+1)
-        plt.imshow(bfield[..., i, d].cpu(), vmin=vmin, vmax=vmax, cmap='RdBu_r')
-        plt.title(f'B-field {axes[d]}')
-        plt.axis('off')
-        plt.subplot(2, 3, d+4)
-        plt.imshow(bfield_analytic[..., i, d].cpu(), vmin=vmin, vmax=vmax, cmap='RdBu_r')
-        plt.title(f'B-field {d} (analytic)')
-        plt.axis('off')
-    plt.tight_layout()
+def show_fields(field, field_analytic):
+    for i in range(im_size[2]):
+        plt.figure(figsize=(12, 6))
+        zslc = crds[0, 0, i, 2].item() * 1e2
+        axes = ['X', 'Y', 'Z']
+        plt.suptitle(f'Z = {zslc:.2f} cm')
+        for d in range(3):
+            vmin = field[..., i, d].median() - 3 * field_analytic[..., i, d].std()
+            vmax = field[..., i, d].median() + 3 * field_analytic[..., i, d].std()
+            plt.subplot(2, 3, d+1)
+            plt.imshow(field[..., i, d].cpu(), vmin=vmin, vmax=vmax, cmap='RdBu_r')
+            plt.title(f'Field {axes[d]}')
+            plt.axis('off')
+            plt.subplot(2, 3, d+4)
+            plt.imshow(field_analytic[..., i, d].cpu(), vmin=vmin, vmax=vmax, cmap='RdBu_r')
+            plt.title(f'Field {d} (analytic)')
+            plt.axis('off')
+        plt.tight_layout()
+show_fields(gfield, gfield_analytic)
         
 # 3D scatter crds loop
 fig = plt.figure()

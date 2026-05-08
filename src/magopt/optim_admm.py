@@ -1,12 +1,14 @@
 import torch
+import cvxpy as cp
 
 from torch import nn
+from torch.backends import cpu
 from tqdm import tqdm
 from typing import Optional, Callable, Union
 from einops import rearrange
 
 # Constants
-lamda_stability = 1e-12  # for numerical stability in x-update
+lamda_stability = 1e-6  # for numerical stability in x-update
 
 def detach_state(*args):
     return [x.detach() for x in args]
@@ -494,17 +496,130 @@ def g_block_update_band_exact(q: torch.Tensor,
 
     return g, gamma
 
+def gmin_update_quasi(sG_hat: torch.Tensor,
+                      sE_hat: torch.Tensor,
+                      t: float,
+                      rhoG: float,
+                      rhoE: float,
+                      Gmin_low: float = 1e-2,
+                      Gmin_high: float = 10.0,
+                      tol: float = 1e-3,
+                      linearity_pcnt: Optional[float] = None) -> tuple[torch.Tensor, float]:
+    """
+    Update rule for Gmin in quasi-convex minimization approach.
+    
+    Solves:
+    min_Gmin rhog/2 * sum_m max(0, Gmin - sG_hat_m)^2 
+           + rhoE/2 * sum_k max(0, ||sE_hat_k||_2 - t * Gmin)^2
+           
+    we will solve the above with a seprate bisection search over Gmin, 
+    not to be confused with the bisection search over t in the main loop.
+           
+    Args
+    ----
+    sG_hat : torch.Tensor
+        tensor with shape (M,), slack consistency term for G
+    sE_hat : torch.Tensor
+        tensor with shape (K, D), slack consistency term for E
+    t : float
+        quasi-convex parameter
+    rhoG : float
+        penalty for G
+    rhoE : float
+        penalty for E
+    Gmin_low : float, optional
+        lower bound for Gmin
+    Gmin_high : float, optional
+        upper bound for Gmin
+    tol : float, optional
+        tolerance for the bisection search
+        
+    Returns
+    -------
+    Gmin : float
+        Optimal Gmin
+    """
+    
+    # Function
+    def f(Gmin: float) -> float:
+        if linearity_pcnt is None:
+            diff_g = Gmin - sG_hat
+            diff_e = torch.norm(sE_hat, dim=-1) - t * Gmin
+            mask_g = 1.0 * (diff_g > 0)
+            mask_e = 1.0 * (diff_e > 0)
+            return 0.5 * rhoG * (diff_g * mask_g).square().sum(dim=-1) \
+                 + 0.5 * rhoE * (diff_e * mask_e).square().sum(dim=-1) - Gmin[:, 0] # maximize Gmin
+        else:
+            Gmax = (1 + linearity_pcnt) * Gmin
+            diff_gmin = Gmin - sG_hat
+            diff_gmax = sG_hat - Gmax
+            diff_e = torch.norm(sE_hat, dim=-1) - t * Gmin
+            mask_gmin = 1.0 * (diff_gmin > 0)
+            mask_gmax = 1.0 * (diff_gmax > 0)
+            mask_e = 1.0 * (diff_e > 0)
+            return 0.5 * rhoG * (diff_gmin * mask_gmin).square().sum(dim=-1) \
+                 + 0.5 * rhoG * (diff_gmax * mask_gmax).square().sum(dim=-1) \
+                 + 0.5 * rhoE * (diff_e * mask_e).square().sum(dim=-1) - Gmin[:, 0] # maximize Gmin
+    
+    # function to evaluate derivative of objective function with respect to Gmin
+    def fprime(Gmin: float) -> float:
+        if linearity_pcnt is None:
+            diff_g = Gmin - sG_hat
+            diff_e = torch.norm(sE_hat, dim=-1) - t * Gmin
+            mask_g = 1.0 * (diff_g > 0)
+            mask_e = 1.0 * (diff_e > 0)
+            return rhoG * (diff_g * mask_g).sum(dim=-1) - t * rhoE * (diff_e * mask_e).sum(dim=-1) - 1
+        else:
+            Gmax = (1 + linearity_pcnt) * Gmin
+            diff_gmin = Gmin - sG_hat
+            diff_gmax = sG_hat - Gmax
+            diff_e = torch.norm(sE_hat, dim=-1) - t * Gmin
+            mask_gmin = 1.0 * (diff_gmin > 0)
+            mask_gmax = 1.0 * (diff_gmax > 0)
+            mask_e = 1.0 * (diff_e > 0)
+            return rhoG * (diff_gmin * mask_gmin).sum(dim=-1) \
+                 - rhoG * (diff_gmax * mask_gmax).sum(dim=-1) * (1 + linearity_pcnt) \
+                 - t * rhoE * (diff_e * mask_e).sum(dim=-1) - 1
+            
+    gmins = torch.linspace(Gmin_low, Gmin_high, 500, device=sG_hat.device)
+    fs = f(gmins[:, None])
+    amin = fs.argmin()
+    # print(f'Gmin: {gmins[amin]:1.3e}')
+    return gmins[amin]
+    fps = fprime(gmins[:, None])
+    import matplotlib.pyplot as plt
+    plt.plot(gmins.cpu(), fs.cpu())
+    plt.show()
+    quit()
+    
+    # Bisection search
+    Gl = Gmin_low
+    Gh = Gmin_high
+    while Gh - Gl > tol:
+        Gm = (Gl + Gh) / 2
+        if fprime(Gm) > 0:
+            Gh = Gm
+        else:
+            Gl = Gm
+            
+    return Gm
+        
 def admm_general(G: torch.Tensor,
                  L: torch.Tensor,
                  E: torch.Tensor,
+                 P: Optional[torch.Tensor] = None,
                  C: Optional[torch.Tensor] = None,
                  d: Optional[torch.Tensor] = None,
+                 F: Optional[torch.Tensor] = None,
+                 g: Optional[torch.Tensor] = None,
+                 t: Optional[float] = None,
                  lamdaG: Optional[float] = None,
                  Gmin: Optional[float] = None,
                  lamdaL: Optional[float] = None,
                  Lmax: Optional[float] = None,
                  lamdaE: Optional[float] = None,
                  Emax: Optional[float] = None,
+                 Pmax: Optional[float] = None,
                  linearity_pcnt: Optional[float] = None,
                  state_dict: Optional[dict] = None,
                  rho: float = 1e-2,
@@ -512,16 +627,21 @@ def admm_general(G: torch.Tensor,
                  rho_adapt: bool = False,
                  log_data: bool = True,
                  verbose: bool = True) -> dict:
-    f"""
+    """
     Solves:
-    min_(x, Gmin, Lmax, Emax) lamda_G * Gmin + lamda_L * Lmax + lamda_E * Emax
+    min_(x, Gmin, Lmax, Emax) -lamda_G * Gmin + lamda_L * Lmax + lamda_E * Emax
     s.t. Gmin <= Gx
          ||Lx||_2^2 <= Lmax
          ||E_k x||_2 <= Emax for k=1...K
+         ||P_w x||_2 <= Pmax for w=1...W
          |Cx| <= d
+         Fx = g
          
     if linearity_pcnt is given, then:
     Gmin <= Gx <= (1 + linearity_pcnt) * Gmin.
+    
+    if t is given then forces:
+    Emax <= t * Gmin
          
     Args
     ----
@@ -531,10 +651,16 @@ def admm_general(G: torch.Tensor,
         tensor with shape (N, N)
     E : torch.Tensor
         tensor with shape (K, D, N)
+    P : torch.Tensor, optional
+        tensor with shape (W, D, N). If None, a dummy (1, 1, N) zero matrix is used (constraint inactive).
     C : torch.Tensor, optional
         tensor with shape (Mc, N)
     d : torch.Tensor, optional
         tensor with shape (Mc,)
+    F : torch.Tensor, optional
+        tensor with shape (Mf, N)
+    g : torch.Tensor, optional
+        tensor with shape (Mf,)
     lamdaG : float, optional
         Regularization parameter for the G constraint.
     Gmin : float, optional
@@ -547,6 +673,8 @@ def admm_general(G: torch.Tensor,
         Regularization parameter for the E constraint.
     Emax : float, optional
         Maximum value for E.
+    Pmax : float, optional
+        Maximum value for ||P_w x||_2 (all w). Either lamdaP or Pmax must be provided when P is not None.
     linearity_pcnt : float, optional
         Percentage of linearity for the G constraint.
     state_dict : dict, optional
@@ -555,11 +683,14 @@ def admm_general(G: torch.Tensor,
         - 'dG': torch.Tensor of shape (N,), dual  for G
         - 'sL': torch.Tensor of shape (N,), slack for L
         - 'dL': torch.Tensor of shape (N,), dual  for L
-        - 'sE': torch.Tensor of shape (K,), slack for E
-        - 'dE': torch.Tensor of shape (K,), dual  for E
+        - 'sE': torch.Tensor of shape (K, D), slack for E
+        - 'dE': torch.Tensor of shape (K, D), dual  for E
+        - 'sP': torch.Tensor of shape (W, D), slack for P
+        - 'dP': torch.Tensor of shape (W, D), dual  for P
         - 'rhoG': float, penalty for G
         - 'rhoL': float, penalty for L
         - 'rhoE': float, penalty for E
+        - 'rhoP': float, penalty for P
     rho : float, optional
         Initial ADMM penalty parameter.
     admm_iters : int, optional
@@ -595,12 +726,21 @@ def admm_general(G: torch.Tensor,
     assert (lamdaE is not None and Emax is None) or (lamdaE is None and Emax is not None), \
     "Either a lamda or a variable must be provided for E."
     
-    # Default C, d if not provided
-    if C is None:
+    # Default P when not provided (inactive constraint)
+    if P is None:
+        P = torch.zeros((1, 3, N), device=G.device)
+        Pmax = 1.0
+    W, Dp, _ = P.shape
+    
+    # Default C, d, F, g if not provided
+    if C is None or d is None:
         C = torch.zeros((1, N), device=torch_dev)
-    if d is None:
         d = torch.ones((1,), device=torch_dev)
     Mc = C.shape[0]
+    if F is None or g is None:
+        F = torch.zeros((1, N), device=torch_dev)
+        g = torch.zeros((1,), device=torch_dev)
+    Mf = F.shape[0]
     
     # G Update rule depending on if a lamda or a variable is provided
     if lamdaG is None:
@@ -630,31 +770,58 @@ def admm_general(G: torch.Tensor,
     if lamdaE is None:
         def update_E(qE, rhoE):
             Emax_new = Emax
-            # slack_new = proj_l2_ball(qE, Emax_new)
-            slack_new = e_block_update_exact(qE, 0, 0, e_fixed=Emax_new)[0]
+            slack_new = proj_l2_ball(qE, Emax_new)
+            # slack_new = e_block_update_exact(qE, 0, 0, e_fixed=Emax_new)[0]
             return slack_new, Emax_new
     else:
         def update_E(qE, rhoE):
             # slack_new, Emax_new = solve_epigraph_group_l2(qE, rhoE/2/lamdaE, max_iter=20)
             slack_new, Emax_new = e_block_update_exact(qE, lamdaE, rhoE)
             return slack_new, Emax_new
+        
+    # Special G-E update rule for quasi-convex minimization
+    if t is not None:
+        def update_G_E(qG, qE, rhoG, rhoE):
+            # Find optimal Gmin
+            Gmin_opt = gmin_update_quasi(qG, qE, t, rhoG, rhoE, linearity_pcnt=linearity_pcnt)
+            
+            # Update variables
+            Gmin_new = Gmin_opt
+            Emax_new = t * Gmin_opt
+            sG_new = torch.clamp(qG, min=Gmin_new)
+            sE_new = proj_l2_ball(qE, Emax_new)
+            return Gmin_new, Emax_new, sG_new, sE_new
+            
+    # P Update rule (same structure as E: group L2 ball)
+    def update_P(qP, rhoP):
+        Pmax_new = Pmax
+        # slack_new = e_block_update_exact(qP, 0, 0, e_fixed=Pmax_new)[0]
+        slack_new = proj_l2_ball(qP, Pmax_new)
+        return slack_new, Pmax_new
     
     # Initialize variables if they are not provided in state_dict
     if state_dict is None:
         state_dict = {}
     sE = state_dict.get('sE', torch.zeros((K, D), device=torch_dev))
     dE = state_dict.get('dE', torch.zeros((K, D), device=torch_dev))
+    sP = state_dict.get('sP', torch.zeros((W, Dp), device=torch_dev))
+    dP = state_dict.get('dP', torch.zeros((W, Dp), device=torch_dev))
     sG = state_dict.get('sG', torch.zeros((M,), device=torch_dev))
     dG = state_dict.get('dG', torch.zeros((M,), device=torch_dev))
     sL = state_dict.get('sL', torch.zeros((N,), device=torch_dev))
     dL = state_dict.get('dL', torch.zeros((N,), device=torch_dev))
     sC = state_dict.get('sC', torch.zeros((Mc,), device=torch_dev))
     dC = state_dict.get('dC', torch.zeros((Mc,), device=torch_dev))
+    sF = state_dict.get('sF', torch.zeros((Mf,), device=torch_dev))
+    dF = state_dict.get('dF', torch.zeros((Mf,), device=torch_dev))
     rhoE = state_dict.get('rhoE', rho)
+    rhoP = state_dict.get('rhoP', rho)
     rhoG = state_dict.get('rhoG', rho)
     rhoL = state_dict.get('rhoL', rho)
     rhoC = state_dict.get('rhoC', rho)
+    rhoF = state_dict.get('rhoF', rho)
     Estack = rearrange(E, 'K D N -> (K D) N')  # (K*D, N)
+    Pstack = rearrange(P, 'W D N -> (W D) N')  # (W*D, N)
     stability_I = lamda_stability * torch.eye(N, device=torch_dev)  # for numerical stability in x-update
     
     # Track diagnostics
@@ -663,7 +830,7 @@ def admm_general(G: torch.Tensor,
         dct['r_pri'] = []
     if 's_dual' not in dct and log_data:
         dct['s_dual'] = []
-    if 'Em' not in dct and log_data:
+    if 'Gmin' not in dct and log_data:
         dct['Gmin'] = []
     if 'Lmax' not in dct and log_data:
         dct['Lmax'] = []
@@ -671,54 +838,79 @@ def admm_general(G: torch.Tensor,
         dct['Emax'] = []
         
     # ADMM iterations
-    for i in tqdm(range(admm_iters), desc='ADMM iterations', disable=not verbose):
+    miniters = admm_iters//20
+    pbar = tqdm(range(admm_iters), desc='ADMM iterations', disable=not verbose, miniters=miniters)
+    for i in pbar:
         
         # x-update
         big_A = rhoE * (Estack.T @ Estack) + \
+                rhoP * (Pstack.T @ Pstack) + \
                 rhoG * (G.T @ G) + \
                 rhoL * (L.T @ L) + \
                 rhoC * (C.T @ C) + \
+                rhoF * (F.T @ F) + \
                 stability_I
         big_B = rhoE * Estack.T @ rearrange(sE - dE, 'K D -> (K D)') + \
+                rhoP * Pstack.T @ rearrange(sP - dP, 'W D -> (W D)') + \
                 rhoG * (G.T @ (sG - dG)) + \
                 rhoL * (L.T @ (sL - dL)) + \
-                rhoC * (C.T @ (sC - dC))
+                rhoC * (C.T @ (sC - dC)) + \
+                rhoF * (F.T @ (sF - dF))
         x_new = torch.linalg.solve(big_A, big_B)
         
-        # G slack updates
-        qG = G @ x_new + dG
-        sG_new, Gmin_new = update_G(qG, rhoG)
+        # G-E updates jointly
+        if t is not None:
+            qG = G @ x_new + dG
+            qE = E @ x_new + dE
+            Gmin_new, Emax_new, sG_new, sE_new = update_G_E(qG, qE, rhoG, rhoE)
+        else:
+            # G updates
+            qG = G @ x_new + dG
+            sG_new, Gmin_new = update_G(qG, rhoG)
+            
+            # E  updates
+            qE = E @ x_new + dE
+            sE_new, Emax_new = update_E(qE, rhoE)
         
         # L slack updates
         qL = L @ x_new + dL
         sL_new, Lmax_new = update_L(qL, rhoL)
         
-        # E slack updates
-        qE = E @ x_new + dE
-        sE_new, Emax_new = update_E(qE, rhoE)
+        # P slack updates
+        qP = P @ x_new + dP
+        sP_new, _ = update_P(qP, rhoP)
         
         # C slack updates
         qC = C @ x_new + dC
         sC_new = torch.clamp(qC, min=-d, max=d)
         
+        # F slack updates
+        sF_new = g
+        
         # Primal Residual
         rpG = G @ x_new - sG_new
         rpL = L @ x_new - sL_new
         rpE = E @ x_new - sE_new
+        rpP = P @ x_new - sP_new
         rpC = C @ x_new - sC_new
+        rpF = F @ x_new - sF_new
         
         # Dual Residual
         if log_data:
             rdG = rhoG * G.T @ (sG_new - sG)
             rdL = rhoL * L.T @ (sL_new - sL)
             rdE = rhoE * Estack.T @ (rearrange(sE_new - sE, 'K D -> (K D)'))
+            rdP = rhoP * Pstack.T @ (rearrange(sP_new - sP, 'W D -> (W D)'))
             rdC = rhoC * C.T @ (sC_new - sC)
+            rdF = rhoF * F.T @ (sF_new - sF)
         
         # Dual updates
         dG = dG + rpG
         dL = dL + rpL
         dE = dE + rpE
+        dP = dP + rpP
         dC = dC + rpC
+        dF = dF + rpF
         
         # Update variables
         x = x_new
@@ -728,33 +920,38 @@ def admm_general(G: torch.Tensor,
         sG = sG_new
         sL = sL_new
         sE = sE_new
+        sP = sP_new
         sC = sC_new
+        sF = sF_new
         
         # Rho adapt
-        if i % 10 == 0 and rho_adapt:
+        # if i % 1 == 0 and rho_adapt:
+        if rho_adapt:
             rhoG, dG = boyd_update(rpG.norm(), rdG.norm(), rhoG, dG)
             rhoL, dL = boyd_update(rpL.norm(), rdL.norm(), rhoL, dL)
             rhoE, dE = boyd_update(rpE.norm(), rdE.norm(), rhoE, dE)
+            rhoP, dP = boyd_update(rpP.norm(), rdP.norm(), rhoP, dP)
             rhoC, dC = boyd_update(rpC.norm(), rdC.norm(), rhoC, dC)
+            rhoF, dF = boyd_update(rpF.norm(), rdF.norm(), rhoF, dF)
         
         # Diagnostics
         if log_data:
-            r_norm = torch.sqrt(rpG.norm()**2 + rpL.norm()**2 + rpE.norm()**2 + rpC.norm()**2).item()
-            s_norm = torch.sqrt(rdG.norm()**2 + rdL.norm()**2 + rdE.norm()**2 + rdC.norm()**2).item()
+            r_norm = torch.sqrt(rpG.norm()**2 + rpL.norm()**2 + rpE.norm()**2 + rpP.norm()**2 + rpC.norm()**2).item()
+            s_norm = torch.sqrt(rdG.norm()**2 + rdL.norm()**2 + rdE.norm()**2 + rdP.norm()**2 + rdC.norm()**2).item()
             dct['r_pri'].append(r_norm)
             dct['s_dual'].append(s_norm)
-            # dct['Gmin'].append(Gmin_new)
-            # dct['Lmax'].append(Lmax_new)
-            # dct['Emax'].append(Emax_new)
-            if verbose and i % 50 == 0:
-                print(f"Iter {i}, ||r||={r_norm:.4e}, ||s||={s_norm:.4e}")
+            dct['Gmin'].append(Gmin_new)
+            dct['Lmax'].append(Lmax_new)
+            dct['Emax'].append(Emax_new)
+            if verbose and i % miniters == 0:
+                pbar.set_description(f"Iter {i}, ||r||={r_norm:.4e}, ||s||={s_norm:.4e}")
     
-    dct['loss_pri'] = r_norm
-    dct['loss_dual'] = s_norm
+    # dct['loss_pri'] = r_norm
+    # dct['loss_dual'] = s_norm
     dct['x'] = x
-    dct['Gmin'] = Gmin
-    dct['Lmax'] = Lmax
-    dct['Emax'] = Emax
+    dct['Gmin'].append(Gmin)
+    dct['Lmax'].append(Lmax)
+    dct['Emax'].append(Emax)
     dct['sG'] = sG
     dct['dG'] = dG
     dct['rhoG'] = rhoG
@@ -764,25 +961,652 @@ def admm_general(G: torch.Tensor,
     dct['sE'] = sE
     dct['dE'] = dE
     dct['rhoE'] = rhoE
+    dct['sP'] = sP
+    dct['dP'] = dP
+    dct['rhoP'] = rhoP
     dct['sC'] = sC
     dct['dC'] = dC
     dct['rhoC'] = rhoC
+    dct['sF'] = sF
+    dct['dF'] = dF
+    dct['rhoF'] = rhoF
+    return dct
+
+def admm_general_cvxpy(G: torch.Tensor,
+                       L: torch.Tensor,
+                       E: torch.Tensor,
+                       P: Optional[torch.Tensor] = None,
+                       C: Optional[torch.Tensor] = None,
+                       d: Optional[torch.Tensor] = None,
+                       F: Optional[torch.Tensor] = None,
+                       g: Optional[torch.Tensor] = None,
+                       lamdaG: Optional[float] = None,
+                       Gmin: Optional[float] = None,
+                       lamdaL: Optional[float] = None,
+                       Lmax: Optional[float] = None,
+                       lamdaE: Optional[float] = None,
+                       Emax: Optional[float] = None,
+                       Pmax: Optional[float] = None,
+                       linearity_pcnt: Optional[float] = None,
+                       state_dict: Optional[dict] = None,
+                       admm_iters: int = 5_000,
+                       verbose: bool = True) -> dict:
+    f"""
+    Solves the following:
+    min_x f(x) / g(x)
+    s.t. 
+        x \in C
+    where C [
+        ||Lx||_2^2 <= Lmax
+        ||P_w x||_2 <= Pmax for w=1...W
+        |Cx| <= d
+        Fx = g]
+    f(x) = max_k ||E_k x||_2
+    g(x) = min_r (G_r x)
+    
+    This is equivalent to the following feasibility 
+    problem with bisection search on the scalar t:
+    min_(x, Gmin, Emax) 0
+    s.t. 
+        ||E_k x||_2 <= Emax
+        G_r x >= Gmin
+        Emax <= t * Gmin
+        Gmin >= eps
+        x \in C
+        
+    Args:
+    ----
+    G : torch.Tensor
+        tensor with shape (M, N)
+    E : torch.Tensor
+        tensor with shape (K, D, N)
+    L : torch.Tensor, optional
+        tensor with shape (N, N)
+    P : torch.Tensor, optional
+        tensor with shape (W, D, N). If None, a dummy (1, 1, N) zero matrix is used (constraint inactive).
+    C : torch.Tensor, optional
+        tensor with shape (Mc, N)
+    d : torch.Tensor, optional
+        tensor with shape (Mc,)
+    F : torch.Tensor, optional  
+        tensor with shape (Mf, N)
+    g : torch.Tensor, optional
+        tensor with shape (Mf,)
+    Lmax : float, optional
+        Maximum value for L.
+    Pmax : float, optional
+        Maximum value for ||P_w x||_2 (all w). Either lamdaP or Pmax must be provided when P is not None.
+    linearity_pcnt : float, optional
+        Percentage of linearity for the G constraint.
+    state_dict : dict, optional
+        Dictionary containing initial values for:
+        - 'sG': torch.Tensor of shape (N,), slack for G
+        - 'dG': torch.Tensor of shape (N,), dual  for G
+        - 'sL': torch.Tensor of shape (N,), slack for L
+        - 'dL': torch.Tensor of shape (N,), dual  for L
+        - 'sE': torch.Tensor of shape (K, D), slack for E
+        - 'dE': torch.Tensor of shape (K, D), dual  for E
+        - 'sP': torch.Tensor of shape (W, D), slack for P
+        - 'dP': torch.Tensor of shape (W, D), dual  for P
+        - 'rhoG': float, penalty for G
+        - 'rhoL': float, penalty for L
+        - 'rhoE': float, penalty for E
+        - 'rhoP': float, penalty for P
+    admm_iters : int, optional
+        Number of ADMM iterations.
+    log_data : bool, optional
+        Whether to log residuals and objective values.
+    verbose : bool, optional
+        Whether to display progress bars.
+        
+    Returns
+    -------
+    dict
+    """
+    # move to CPU
+    torch_dev = G.device
+    G = G.cpu()
+    E = E.cpu()
+    L = L.cpu() if L is not None else None
+    P = P.cpu() if P is not None else None
+    C = C.cpu() if C is not None else None
+    d = d.cpu() if d is not None else None
+    F = F.cpu() if F is not None else None
+    g = g.cpu() if g is not None else None
+    
+    # Setup cvxpy 
+    x = cp.Variable(G.shape[1])
+    Gmin = cp.Variable(1) if Gmin is None else Gmin
+    Emax = cp.Variable(1) if Emax is None else Emax
+    Lmax = cp.Variable(1) if Lmax is None else Lmax
+    
+    # Field constraints
+    field_constraints = [cp.norm(E[k] @ x, axis=0) <= Emax for k in range(len(E))]
+    field_constraints += [G @ x >= Gmin]
+    
+    # Hardware constraints
+    hw_constraints = []
+    if P is not None:
+        hw_constraints += [cp.norm(P[w] @ x, axis=0) <= Pmax for w in range(len(P))]
+    if C is not None:
+        hw_constraints += [C @ x <= d]
+    if F is not None:
+        hw_constraints += [F @ x == g]
+    if L is not None:
+        hw_constraints += [cp.square(cp.norm(L @ x)) <= Lmax]
+    constraints = field_constraints + hw_constraints
+    
+    # Objective
+    obj = 0
+    if lamdaG is not None:
+        obj += -lamdaG * Gmin
+    if lamdaL is not None:
+        obj += lamdaL * Lmax
+    if lamdaE is not None:
+        obj += lamdaE * Emax
+    obj = cp.Minimize(obj)
+    
+    # Solve
+    prob = cp.Problem(obj, constraints)
+    prob.solve(solver=cp.MOSEK,
+               mosek_params={
+                "MSK_DPAR_INTPNT_CO_TOL_REL_GAP": 1e-6,
+                "MSK_DPAR_INTPNT_CO_TOL_PFEAS": 1e-6,
+                "MSK_DPAR_INTPNT_CO_TOL_DFEAS": 1e-6,
+                "MSK_IPAR_INTPNT_MAX_ITERATIONS": 50,
+                "MSK_IPAR_NUM_THREADS": 8,  # adjust to your machine
+                },
+               verbose=verbose)
+    
+def quasi_convex_min_ratio(G: torch.Tensor,
+                           E: torch.Tensor,
+                           tstart: float = 10.0,
+                           L: Optional[torch.Tensor] = None,
+                           P: Optional[torch.Tensor] = None,
+                           C: Optional[torch.Tensor] = None,
+                           d: Optional[torch.Tensor] = None,
+                           F: Optional[torch.Tensor] = None,
+                           g: Optional[torch.Tensor] = None,
+                           Lmax: Optional[float] = None,
+                           Pmax: Optional[float] = None,
+                           linearity_pcnt: Optional[float] = None,
+                           state_dict: Optional[dict] = None,
+                           rho: float = 1e-2,
+                           bisection_iters: int = 7,
+                           admm_iters: int = 5_000,
+                           admm_iters_reduced: int = 5_000,
+                           rho_adapt: bool = False,
+                           log_data: bool = True,
+                           verbose: bool = True) -> dict:
+    f"""
+    Solves the following:
+    min_x f(x) / g(x)
+    s.t. 
+        x \in C
+    where C [
+        ||Lx||_2^2 <= Lmax
+        ||P_w x||_2 <= Pmax for w=1...W
+        |Cx| <= d
+        Fx = g]
+    f(x) = max_k ||E_k x||_2
+    g(x) = min_r (G_r x)
+    
+    This is equivalent to the following feasibility 
+    problem with bisection search on the scalar t:
+    min_(x, Gmin, Emax) 0
+    s.t. 
+        ||E_k x||_2 <= Emax
+        G_r x >= Gmin
+        Emax <= t * Gmin
+        Gmin >= eps
+        x \in C
+        
+    Args:
+    ----
+    G : torch.Tensor
+        tensor with shape (M, N)
+    L : torch.Tensor
+        tensor with shape (N, N)
+    E : torch.Tensor
+        tensor with shape (K, D, N)
+    P : torch.Tensor, optional
+        tensor with shape (W, D, N). If None, a dummy (1, 1, N) zero matrix is used (constraint inactive).
+    C : torch.Tensor, optional
+        tensor with shape (Mc, N)
+    d : torch.Tensor, optional
+        tensor with shape (Mc,)
+    F : torch.Tensor, optional
+        tensor with shape (Mf, N)
+    g : torch.Tensor, optional
+        tensor with shape (Mf,)
+    Lmax : float, optional
+        Maximum value for L.
+    Pmax : float, optional
+        Maximum value for ||P_w x||_2 (all w). Either lamdaP or Pmax must be provided when P is not None.
+    linearity_pcnt : float, optional
+        Percentage of linearity for the G constraint.
+    state_dict : dict, optional
+        Dictionary containing initial values for:
+        - 'sG': torch.Tensor of shape (N,), slack for G
+        - 'dG': torch.Tensor of shape (N,), dual  for G
+        - 'sL': torch.Tensor of shape (N,), slack for L
+        - 'dL': torch.Tensor of shape (N,), dual  for L
+        - 'sE': torch.Tensor of shape (K, D), slack for E
+        - 'dE': torch.Tensor of shape (K, D), dual  for E
+        - 'sP': torch.Tensor of shape (W, D), slack for P
+        - 'dP': torch.Tensor of shape (W, D), dual  for P
+        - 'rhoG': float, penalty for G
+        - 'rhoL': float, penalty for L
+        - 'rhoE': float, penalty for E
+        - 'rhoP': float, penalty for P
+    rho : float, optional
+        Initial ADMM penalty parameter.
+    bisection_iters : int, optional
+        Number of bisection iterations.
+    admm_iters : int, optional
+        Number of ADMM iterations.
+    rho_adapt : bool, optional
+        Whether to use rho adaptation.
+    log_data : bool, optional
+        Whether to log residuals and objective values.
+    verbose : bool, optional
+        Whether to display progress bars.
+        
+    Returns
+    -------
+    dict
+    """
+    # # To CPU for cvxpy
+    # torch_dev = G.device
+    # G = G.cpu()
+    # E = E.cpu()
+    # L = L.cpu() if L is not None else None
+    # P = P.cpu() if P is not None else None
+    # C = C.cpu() if C is not None else None
+    # d = d.cpu() if d is not None else None
+    # F = F.cpu() if F is not None else None
+    # g = g.cpu() if g is not None else None
+    # dct =  quasi_convex_min_ratio_cvxpy(G=G, E=E, tstart=tstart, 
+    #                                     L=L, P=P, C=C, d=d, F=F, g=g, 
+    #                                     Lmax=Lmax, Pmax=Pmax, linearity_pcnt=linearity_pcnt, 
+    #                                     state_dict=state_dict, rho=rho, t_tol=t_tol, 
+    #                                     admm_iters=admm_iters, admm_iters_reduced=admm_iters_reduced, 
+    #                                     rho_adapt=rho_adapt, log_data=log_data, verbose=verbose)
+    # dct['x'] = dct['x'].to(torch_dev)
+    # return dct
+
+    # Get shapes from G
+    M, N = G.shape
+    K, D, _ = E.shape
+    
+    dct_ret = None
+    def is_feasible(x: torch.Tensor, 
+                    Emax: float, 
+                    Gmin: float, 
+                    pcnt_tol: float = 0.05,
+                    abs_tol: float = 1e-3,
+                    verbose: bool = True) -> bool:
+        
+        if linearity_pcnt is None:
+            # Gradient should be smaller than Gmin
+            Gmin_actual = (G @ x).min()
+            if Gmin_actual < Gmin * (1 - pcnt_tol):
+                if verbose:
+                    print(f"Gx({Gmin_actual:.2f}) < Gmin({Gmin * (1 - pcnt_tol):.2f})")
+                return False
+        else:
+            Gmin_actual = (G @ x).min()
+            Gmax_actual = (G @ x).max()
+            Gmax = Gmin * (1 + linearity_pcnt)
+            if Gmin_actual < Gmin * (1 - pcnt_tol):
+                if verbose:
+                    print(f"Gx({Gmin_actual:.2f}) < Gmin({Gmin * (1 - pcnt_tol):.2f})")
+                return False
+            if Gmax_actual > Gmax * (1 + pcnt_tol):
+                if verbose:
+                    print(f"Gx({Gmax_actual:.2f}) > Gmax({Gmax * (1 + pcnt_tol):.2f})")
+                return False
+        
+        # Peak Efield should be smaller than Emax
+        Emax_actual = (E @ x).norm(dim=-1).max()
+        if Emax_actual > Emax * (1 + pcnt_tol):
+            if verbose:
+                print(f"||E_k x||_2({Emax_actual:.2f}) > Emax({Emax * (1 + pcnt_tol):.2f})")
+            return False
+        
+        # L should be smaller than Lmax
+        if L is not None:
+            Lmax_actual = (L @ x).norm().square()
+            if Lmax_actual > Lmax * (1 + pcnt_tol):
+                if verbose:
+                    print(f"||Lx||_2^2({Lmax_actual:.3e}) > Lmax({Lmax * (1 + pcnt_tol):.2f})")
+                return False
+            
+        # P should be smaller than Pmax
+        if P is not None:
+            Pmax_actual = (P @ x).norm(dim=-1).max()
+            if Pmax_actual > Pmax * (1 + pcnt_tol):
+                if verbose:
+                    print(f"||P_w x||_2({Pmax_actual:.3e}) > Pmax({Pmax * (1 + pcnt_tol):.2f})")
+                return False
+            
+        # C should be smaller than d
+        if C is not None:
+            Cx_actual = (C @ x).abs()
+            if (Cx_actual - d * (1 + pcnt_tol)).max() > 0:
+                if verbose:
+                    idx_violation = torch.argwhere((Cx_actual - d * (1 + pcnt_tol)) > 0)[:, 0][0]
+                    print(f"|Cx|({Cx_actual[idx_violation]:.3e}) > d({d[idx_violation] * (1 + pcnt_tol):.2f}")
+                return False
+            
+        # F should be equal to g
+        if F is not None:
+            Fx_actual = (F @ x)
+            Fxg = Fx_actual - g
+            if Fxg.abs().max() > abs_tol:
+                if verbose:
+                    idx_violation = torch.argwhere(Fxg.abs() > abs_tol)[:, 0][0]
+                    sign = torch.sign(Fx_actual[idx_violation] - g[idx_violation])
+                    if sign > 0:
+                        print(f"Fx == g constriant violated:\nFx({Fx_actual[idx_violation]:.3e}) > g({abs_tol + g[idx_violation]:.3e})")
+                    else:
+                        print(f"Fx == g constriant violated:\nFx({Fx_actual[idx_violation]:.3e}) < g({-abs_tol + g[idx_violation]:.3e})")
+                return False
+            
+        print(f'Gmin={Gmin_actual:.2f}, Emax={Emax_actual:.2f}, constraints satisfied.')
+            
+        return True
+        
+    # Starting bounds
+    th = 2 * tstart
+    tl = 0
+    assert (th + tl) / 2 == tstart, "Starting bounds must be symmetric around tstart"
+    
+    # Main loop
+    dct = state_dict
+    pbar = tqdm(range(bisection_iters), desc='Bisection iterations', disable=not verbose)
+    for k in pbar:
+        
+        # Bisection search
+        t = (th + tl) / 2
+        
+        # Solve the feasibility problem
+        dct = admm_general(G=G, L=L, E=E, C=C, d=d, F=F, g=g, P=P,
+                           lamdaG=0, lamdaE=0, lamdaL=None,
+                           Lmax=Lmax, Pmax=Pmax, 
+                           linearity_pcnt=linearity_pcnt, 
+                           t=t,
+                        #    state_dict=dct, 
+                           rho=rho, 
+                           admm_iters=admm_iters if k == 0 else admm_iters_reduced, 
+                           rho_adapt=rho_adapt if k == 0 else False, 
+                           log_data=log_data, 
+                           verbose=verbose)# if k == 0 else False)
+        
+        # Check feasibility of solution 
+        # if k == bisection_iters - 2:
+        #     breakpoint()
+        if is_feasible(dct['x'], dct['Emax'][-1], dct['Gmin'][-1]):
+            feas = True
+            th = t
+            dct_ret = dct
+        else:
+            feas = False
+            tl = t
+        t_diff = th - tl
+        
+        # Update progress bar
+        pbar.set_description(f"Bisection Iter {k}, t={t:1.3f}, feas={feas}")
+        
+    return dct_ret
+
+def quasi_convex_min_ratio_cvxpy(G: torch.Tensor,
+                                 E: torch.Tensor,
+                                 tstart: float = 10.0,
+                                 L: Optional[torch.Tensor] = None,
+                                 P: Optional[torch.Tensor] = None,
+                                 C: Optional[torch.Tensor] = None,
+                                 d: Optional[torch.Tensor] = None,
+                                 F: Optional[torch.Tensor] = None,
+                                 g: Optional[torch.Tensor] = None,
+                                 Lmax: Optional[float] = None,
+                                 Pmax: Optional[float] = None,
+                                 linearity_pcnt: Optional[float] = None,
+                                 state_dict: Optional[dict] = None,
+                                 rho: float = 1e-2,
+                                 t_tol: float = 1e-3,
+                                 admm_iters: int = 5_000,
+                                 admm_iters_reduced: int = 5_000,
+                                 rho_adapt: bool = False,
+                                 log_data: bool = True,
+                                 verbose: bool = True) -> dict:
+    f"""
+    Solves the following:
+    min_x f(x) / g(x)
+    s.t. 
+        x \in C
+    where C [
+        ||Lx||_2^2 <= Lmax
+        ||P_w x||_2 <= Pmax for w=1...W
+        |Cx| <= d
+        Fx = g]
+    f(x) = max_k ||E_k x||_2
+    g(x) = min_r (G_r x)
+    
+    This is equivalent to the following feasibility 
+    problem with bisection search on the scalar t:
+    min_(x, Gmin, Emax) 0
+    s.t. 
+        ||E_k x||_2 <= Emax
+        G_r x >= Gmin
+        Emax <= t * Gmin
+        Gmin >= eps
+        x \in C
+        
+    Args:
+    ----
+    G : torch.Tensor
+        tensor with shape (M, N)
+    L : torch.Tensor
+        tensor with shape (N, N)
+    E : torch.Tensor
+        tensor with shape (K, D, N)
+    P : torch.Tensor, optional
+        tensor with shape (W, D, N). If None, a dummy (1, 1, N) zero matrix is used (constraint inactive).
+    C : torch.Tensor, optional
+        tensor with shape (Mc, N)
+    d : torch.Tensor, optional
+        tensor with shape (Mc,)
+    F : torch.Tensor, optional
+        tensor with shape (Mf, N)
+    g : torch.Tensor, optional
+        tensor with shape (Mf,)
+    Lmax : float, optional
+        Maximum value for L.
+    Pmax : float, optional
+        Maximum value for ||P_w x||_2 (all w). Either lamdaP or Pmax must be provided when P is not None.
+    linearity_pcnt : float, optional
+        Percentage of linearity for the G constraint.
+    state_dict : dict, optional
+        Dictionary containing initial values for:
+        - 'sG': torch.Tensor of shape (N,), slack for G
+        - 'dG': torch.Tensor of shape (N,), dual  for G
+        - 'sL': torch.Tensor of shape (N,), slack for L
+        - 'dL': torch.Tensor of shape (N,), dual  for L
+        - 'sE': torch.Tensor of shape (K, D), slack for E
+        - 'dE': torch.Tensor of shape (K, D), dual  for E
+        - 'sP': torch.Tensor of shape (W, D), slack for P
+        - 'dP': torch.Tensor of shape (W, D), dual  for P
+        - 'rhoG': float, penalty for G
+        - 'rhoL': float, penalty for L
+        - 'rhoE': float, penalty for E
+        - 'rhoP': float, penalty for P
+    rho : float, optional
+        Initial ADMM penalty parameter.
+    admm_iters : int, optional
+        Number of ADMM iterations.
+    rho_adapt : bool, optional
+        Whether to use rho adaptation.
+    log_data : bool, optional
+        Whether to log residuals and objective values.
+    verbose : bool, optional
+        Whether to display progress bars.
+        
+    Returns
+    -------
+    dict
+    """
+    # Get shapes from G
+    M, N = G.shape
+    K, D, _ = E.shape
+    
+    def is_feasible(x: torch.Tensor, 
+                    Emax: float, 
+                    Gmin: float, 
+                    pcnt_tol: float = 0.05) -> bool:
+        
+        # Gradient should be smaller than Gmin
+        Gmin_actual = (G @ x).min()
+        if Gmin_actual < Gmin * (1 - pcnt_tol):
+            return False
+        
+        # Peak Efield should be smaller than Emax
+        Emax_actual = (E @ x).norm(dim=-1).max()
+        if Emax_actual > Emax * (1 + pcnt_tol):
+            return False
+        
+        # L should be smaller than Lmax
+        if L is not None:
+            Lmax_actual = (L @ x).norm().square()
+            if Lmax_actual > Lmax * (1 + pcnt_tol):
+                return False
+            
+        # P should be smaller than Pmax
+        if P is not None:
+            Pmax_actual = (P @ x).norm(dim=-1).max()
+            if Pmax_actual > Pmax * (1 + pcnt_tol):
+                return False
+            
+        # C should be smaller than d
+        if C is not None:
+            Cx_actual = (C @ x).abs()
+            if (Cx_actual - d * (1 + pcnt_tol)).max() > 0:
+                return False
+            
+        # F should be equal to g
+        if F is not None:
+            Fxg_actual = (F @ x - g).abs()
+            if (Fxg_actual - g * pcnt_tol).max() > 0:
+                return False
+            
+        return True
+        
+    # Starting bounds
+    th = 2 * tstart
+    tl = 0
+    assert (th + tl) / 2 == tstart, "Starting bounds must be symmetric around tstart"
+    t_diff = float('inf')
+    
+    # Main loop
+    k = 0
+    dct = state_dict
+    while t_diff > t_tol:
+        
+        # Bisection search
+        t = (th + tl) / 2
+        
+        # Setup cvxpy 
+        x = cp.Variable(N)
+        Gmin = cp.Variable(1)
+        Emax = cp.Variable(1)
+        
+        # Field constraints
+        field_constraints = [cp.norm(E[k] @ x, axis=0) <= Emax for k in range(len(E))]
+        field_constraints += [G @ x >= Gmin]
+        field_constraints += [Emax <= t * Gmin]
+        field_constraints += [Gmin >= 0.1]
+        
+        # Hardware constraints
+        hw_constraints = []
+        if P is not None:
+            hw_constraints += [cp.norm(P[w] @ x, axis=0) <= Pmax for w in range(len(P))]
+        if C is not None:
+            hw_constraints += [C @ x <= d]
+        if F is not None:
+            hw_constraints += [F @ x == g]
+        if L is not None:
+            hw_constraints += [cp.square(cp.norm(L @ x)) <= Lmax]
+        constraints = field_constraints + hw_constraints
+        
+        # Solve the feasibility problem
+        # prob = cp.Problem(cp.Maximize(0), constraints)
+        prob = cp.Problem(cp.Maximize(Gmin), constraints)
+        failed = False
+        try:
+            prob.solve(
+                solver=cp.MOSEK,
+                mosek_params={
+                    "MSK_DPAR_INTPNT_CO_TOL_REL_GAP": 1e-6,
+                    "MSK_DPAR_INTPNT_CO_TOL_PFEAS": 1e-6,
+                    "MSK_DPAR_INTPNT_CO_TOL_DFEAS": 1e-6,
+                    "MSK_IPAR_INTPNT_MAX_ITERATIONS": 50,
+                    "MSK_IPAR_NUM_THREADS": 8,  # adjust to your machine
+                },
+                verbose=False,
+            )
+        except:
+            failed = True
+        
+        if prob.status == 'infeasible' or failed:
+            feas = False
+        else:
+            # double check feasibility
+            x_val = torch.from_numpy(x.value).type(torch.float32)
+            Gmin_val = torch.from_numpy(Gmin.value).type(torch.float32)
+            Emax_val = torch.from_numpy(Emax.value).type(torch.float32)
+            feas = is_feasible(x_val, Emax_val, Gmin_val)
+            
+        # Update bounds
+        if feas:
+            th = t
+        else:
+            tl = t
+        
+        # Update iteration counter
+        k += 1
+        t_diff = th - tl
+        if verbose:
+            print(f"Bisection Iter {k}, t={t:1.3f}, t_diff={t_diff:.3e}, feas={feas}")
+    
+    dct = {
+        'x': x_val,
+        'Gmin': [Gmin_val],
+        'Emax': [Emax_val],
+        'Lmax': [Lmax],
+        'r_pri': [],
+        's_dual': [],
+    }
     return dct
 
 def unrolled_admm_general(thetas: list[nn.Parameter],
                           G_theta: Callable[[nn.Parameter], torch.Tensor],
                           L_theta: Callable[[nn.Parameter], torch.Tensor],
                           E_theta: Callable[[nn.Parameter], torch.Tensor],
-                          C_theta: Callable[[nn.Parameter], torch.Tensor],
+                          P_theta: Callable[[nn.Parameter], torch.Tensor] = lambda x : None,
+                          C_theta: Callable[[nn.Parameter], torch.Tensor] = lambda x : None,
+                          F_theta: Callable[[nn.Parameter], torch.Tensor] = lambda x : None,
                           loss_theta: Optional[Callable[[nn.Parameter], float]] = None,
                           d: Optional[torch.Tensor] = None,
+                          g: Optional[torch.Tensor] = None,
                           lamdaG: Optional[float] = None,
                           Gmin: Optional[float] = None,
                           lamdaL: Optional[float] = None,
                           Lmax: Optional[float] = None,
                           lamdaE: Optional[float] = None,
                           Emax: Optional[float] = None,
+                          Pmax: Optional[float] = None,
                           linearity_pcnt: Optional[float] = None,
+                          state_dict: Optional[dict] = None,
                           rho: float = 1e-2,
                           rho_adapt: bool = False,
                           lr: Union[float, list[float]] = 1e-3,
@@ -803,8 +1627,14 @@ def unrolled_admm_general(thetas: list[nn.Parameter],
         Function to compute the L constraint.
     E_theta : Callable[[nn.Parameter], torch.Tensor]
         Function to compute the E constraint.
+    P_theta : Callable[[nn.Parameter], torch.Tensor]
+        Function to compute the P constraint.
     C_theta : Callable[[nn.Parameter], torch.Tensor]
         Function to compute the C constraint.
+    F_theta : Callable[[nn.Parameter], torch.Tensor]
+        Function to compute the F constraint.
+    g : Optional[torch.Tensor]
+        Optional fixed g value.
     loss_theta : Optional[Callable[[nn.Parameter], float]]
         Function to compute the loss.
     d : Optional[torch.Tensor]
@@ -821,8 +1651,12 @@ def unrolled_admm_general(thetas: list[nn.Parameter],
         Optional fixed lamdaE value.
     Emax : Optional[float]
         Optional fixed Emax value.
+    Pmax : Optional[float]
+        Optional fixed Pmax value.
     linearity_pcnt : Optional[float]
         Optional fixed linearity_pcnt value.
+    state_dict : Optional[dict]
+        Optional initial state dictionary.
     rho : float
         Initial ADMM penalty parameter.
     rho_adapt : bool
@@ -860,9 +1694,15 @@ def unrolled_admm_general(thetas: list[nn.Parameter],
         opt = torch.optim.Adam(thetas, lr=lr)
     
     # Initial state
-    state_dict = {'coeffs': []}
+    if state_dict is None:
+        state_dict = {'coeffs': []}
+    else:
+        state_dict['coeffs'] = [state_dict['x'].detach().cpu()]
+    
+    # Initialize theta lists
     for i in range(len(thetas)):
-        state_dict['theta_'+str(i)] = []
+        if 'theta_'+str(i) not in state_dict:
+            state_dict['theta_'+str(i)] = []
     
     # Default loss function
     if loss_theta is None:
@@ -883,19 +1723,29 @@ def unrolled_admm_general(thetas: list[nn.Parameter],
         L = L_theta(thetas)
         E = E_theta(thetas)
         C = C_theta(thetas)
+        P = P_theta(thetas)
+        F = F_theta(thetas)
                 
         # ADMM solve
-        state_dict = admm_general(G=G, L=L, E=E, C=C, d=d, 
-                                  lamdaG=lamdaG, Gmin=Gmin, lamdaL=lamdaL, Lmax=Lmax, lamdaE=lamdaE, Emax=Emax, linearity_pcnt=linearity_pcnt, state_dict=state_dict, rho=rho, admm_iters=admm_iters, rho_adapt=rho_adapt, log_data=log_data, verbose=verbose)
+        state_dict = admm_general(G=G, L=L, E=E, C=C, d=d, F=F, g=g, P=P,
+                                  lamdaG=lamdaG, Gmin=Gmin, lamdaL=lamdaL, Lmax=Lmax, lamdaE=lamdaE, Emax=Emax, Pmax=Pmax, linearity_pcnt=linearity_pcnt, state_dict=state_dict, rho=rho, admm_iters=admm_iters, rho_adapt=rho_adapt, log_data=log_data, verbose=verbose)
         
         # Minimize gradient loss function 
         loss = 0
         if lamdaG is not None:
-            loss -= lamdaG * state_dict['Gmin']
+            # Gminval = state_dict['Gmin'][-1]
+            Gminval = (G @ state_dict['x']).min()
+            loss -= lamdaG * Gminval
         if lamdaL is not None:
-            loss += lamdaL * state_dict['Lmax']
+            # Lmaxval = state_dict['Lmax'][-1]
+            Lmaxval = (L @ state_dict['x']).norm()**2
+            loss += lamdaL * Lmaxval
         if lamdaE is not None:
-            loss += lamdaE * state_dict['Emax']
+            # Emaxval = state_dict['Emax'][-1]
+            Emaxval = (E @ state_dict['x']).norm(dim=-1).max()
+            loss += lamdaE * Emaxval
+        # loss += 1e5 * (state_dict['r_pri'][-1] + state_dict['s_dual'][-1])
+        
             
         # Loss on theta parameters
         loss += loss_theta(thetas)
@@ -910,10 +1760,11 @@ def unrolled_admm_general(thetas: list[nn.Parameter],
             state_dict['coeffs'].append(state_dict['x'].detach().cpu())
             for i in range(len(thetas)):
                 state_dict['theta_'+str(i)].append(thetas[i].detach().cpu())
-            
+                
         # Detach all admm variables
         for k in state_dict.keys():
             if isinstance(state_dict[k], torch.Tensor):
                 state_dict[k] = state_dict[k].detach()
+            
 
     return state_dict

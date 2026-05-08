@@ -13,6 +13,8 @@ from .adult_model import (
     dxyz_duv
 )
 
+MM_TO_M = 1e-3
+
 class body_charge_model:
     
     """
@@ -26,8 +28,8 @@ class body_charge_model:
     The total E-field is given by \\
     Ecoil(r) = A(r) x \\
     Echarge(r) = B(r) c \\
-    Etotal(r) = -Ecoil(r) + Echarge(r)  \\
-    Etotal(r) = -A(r) x + B(r) c 
+    Etotal(r) = -Ecoil(r) - Echarge(r)  \\
+    Etotal(r) = -A(r) x - B(r) c 
     
     Charge conservation at the surface gives us \\
     n(r) . Etotal(r) = 0 \\ 
@@ -61,8 +63,8 @@ class body_charge_model:
     def __init__(self,
                  ulin: torch.Tensor,
                  vlin: torch.Tensor,
-                 M_fourier_modes: int = 50,
-                 N_hat_modes: int = 10):
+                 M_fourier_modes: int = 7,
+                 N_hat_modes: int = 50):
         """
         Args
         ----
@@ -93,8 +95,9 @@ class body_charge_model:
         
     def calc_efield_charge_matrix(self,
                                   crds_efield: torch.Tensor,
-                                  num_us: int = 500,
-                                  num_vs: int = 500,
+                                  num_us: int = 1000,
+                                  num_vs: int = 1000,
+                                  delta_inwards: float = 5e-3,
                                   urange: Optional[tuple] = None,
                                   vrange: Optional[tuple] = None,
                                   surface_batch_size: Optional[int] = None,
@@ -110,6 +113,8 @@ class body_charge_model:
             Number of points in the azimuthal (u) direction
         num_vs : int
             Number of points in the longitudinal (v) direction
+        delta_inwards : float
+            Distance to move the surface inwards to avoid singularities
         urange : tuple
             Range of u values (min, max)
         vrange : tuple
@@ -132,6 +137,7 @@ class body_charge_model:
         if surface_batch_size is None:
             surface_batch_size = (num_us * num_vs) // 10  # Process 10% of surface at a time
         eps0 = 8.8541878188e-12  # Vacuum permittivity
+        Ne = crds_efield.shape[0]
         torch_dev = crds_efield.device
         
         # Generate (u, v) grid
@@ -145,41 +151,76 @@ class body_charge_model:
         S = len(us) # Total number of surface points
         
         # Generate surface coordinates and normals
-        crds_surf = uv_to_xyz(us, vs)
-        normals = uv_to_normals(us, vs)
+        crds_surf = uv_to_xyz(us, vs) * MM_TO_M # m
+        normals = uv_to_normals(us, vs) * MM_TO_M # m
         normals_normalized = normals / torch.linalg.norm(normals, axis=-1, keepdim=True)
-        tang_surf = dxyz_duv(us, vs)
+        tang_surf = dxyz_duv(us, vs) * MM_TO_M # m
         areas = torch.cross(tang_surf[:, 0, :], tang_surf[:, 1, :], dim=-1).norm(dim=-1) * du * dv
         
         # Move surface just a bit inwards to avoid singularities
-        delta = 1e-4
-        crds_surf = crds_surf - delta * normals_normalized
+        crds_surf = crds_surf - delta_inwards * normals_normalized
 
         # E-field matrix placeholder
-        ncoeff = 2 * self.M * self.N
-        Emat_charge = torch.zeros((*crds_efield.shape[:-1], ncoeff, 3), dtype=torch.float32, device=torch_dev)
+        Emat_charge = torch.zeros((Ne, self.M, self.N, 3), dtype=torch.float32, device=torch_dev)
+        
+        # arrays for selecting bases
+        ms_all = torch.arange(self.M, device=torch_dev)
+        M_batch_size = 4
         
         # Heavy batching, this is one time so that's okay.
         for n in tqdm(range(self.N), 'Building Surface E-field Matrix',  disable=not verbose):
-            for m in range(self.M):
+            for m1 in range(0, self.M, M_batch_size):
+                m2 = min(m1 + M_batch_size, self.M)
+                ms = ms_all[m1:m2]
                 for s1 in range(0, S, surface_batch_size):
+                    
                     s2 = min(s1 + surface_batch_size, S)
                 
                     # Build bases
-                    Um_sin, Um_cos = self._ubases(us[s1:s2], m) # S
+                    Um = self._ubases(us[s1:s2, None], ms) # S M
                     Vn = self._vbases(vs[s1:s2], n) # S
                     
                     # Distance kernel
                     diff = crds_efield[:, None] - crds_surf[None, s1:s2] # Ne S 3
-                    denom = 1 / torch.linalg.norm(diff, axis=-1, keepdim=True) ** 3 # Ne S 1
+                    denom = 1 / (torch.linalg.norm(diff, axis=-1, keepdim=True) ** 3) # Ne S 1
                     
                     # Integrate
-                    integrand = (diff * denom * (Vn * Um_cos * areas[s1:s2])[None, :, None]).sum(dim=1) # Ne 3
-                    Emat_charge[:, 2 * (m * self.N + n), :] +=  integrand * 1 / (4 * torch.pi * eps0) # Cosine term
-                    integrand = (diff * denom * (Vn * Um_sin * areas[s1:s2])[None, :, None]).sum(dim=1) # Ne 3
-                    Emat_charge[:, 2 * (m * self.N + n) + 1, :] +=  integrand * 1 / (4 * torch.pi * eps0) # Sine term
+                    integrand = (diff[:, :, None] * denom[:, :, None] * (Vn[None, :, None, None] * Um[None, :, :, None] * areas[None, s1:s2, None, None])).sum(dim=1) # Ne M 3
+                    Emat_charge[:, ms, n, :] +=  integrand * 1 / (4 * torch.pi * eps0) 
 
+        Emat_charge =  Emat_charge.reshape(Ne, -1, 3)
         return Emat_charge
+    
+    def calc_charge_matrix(self):
+        """
+        Calculates the charge matrix that maps the surface charge coefficients to the charge at the specified coordinates.
+        
+        Args
+        ----
+        urange : tuple
+            Range of u values (min, max)
+        vrange : tuple
+            Range of v values (min, max)
+        
+        Returns
+        -------
+        charge_mat : torch.Tensor
+            Charge matrix with shape (Ne_surf, ncoeff)
+        """
+        # Consts
+        Ne_surf = self.uv_crds.shape[0]
+        charge_mat = torch.zeros((Ne_surf, self.M, self.N), dtype=torch.float32, device=self.torch_dev)
+        
+        # Build bases
+        ms = torch.arange(self.M, device=self.torch_dev)
+        ns = torch.arange(self.N, device=self.torch_dev)
+        Um = self._ubases(self.uv_crds[:, None, 0], ms) # Ne_surf M
+        Vn = self._vbases(self.uv_crds[:, None, 1], ns) # Ne_surf N
+        
+        # Build charge matrix
+        charge_mat = einsum(Um, Vn, 'Ne_surf M, Ne_surf N -> Ne_surf M N')
+        
+        return charge_mat.reshape(Ne_surf, -1)
     
     def _calc_P_matrix(self,
                        Efield_charge_mat_surf: torch.Tensor,
@@ -213,8 +254,8 @@ class body_charge_model:
         MTM = M.T @ M
         MTY = M.T @ Y
         I = torch.eye(MTM.shape[0], device=MTM.device)
-        P = torch.linalg.solve(MTM + lam * I, MTY)
-        # P = lin_solve(MTM, MTY, lamda=lam, solver='solve')
+        # P = torch.linalg.solve(MTM + lam * I, MTY)
+        P = torch.linalg.pinv(MTM) @ MTY
         
         return P
     
@@ -267,7 +308,8 @@ class body_charge_model:
     def show_surface(self,
                      fields: Optional[torch.Tensor] = None,
                      alpha: float = 1.0,
-                     colorbar_label: str = '',
+                     cmap: str = 'jet',
+                     colorbar_label: Optional[str] = '',
                      vmin: Optional[float] = None,
                      vmax: Optional[float] = None,
                      ax: Optional[plt.Axes] = None,
@@ -282,7 +324,9 @@ class body_charge_model:
         alpha : float
             Transparency of the surface
         colorbar_label : str
-            Label for the colorbar
+            Label for the colorbar. If None, no colorbar is shown.
+        cmap : str
+            Colormap to use
         vmin : float
             Minimum value for color scaling
         vmax : float
@@ -328,8 +372,6 @@ class body_charge_model:
             
         # Reshape to regular grid
         xyz_crds_grd = self.xyz_crds.reshape(self.num_us, self.num_vs, 3)
-        if fields is not None:
-            fields = fields.reshape(self.num_us, self.num_vs, 3)
         
         # Get surface crds in cm
         xs = xyz_crds_grd[:, :, 0].cpu() * 1e2 # cm
@@ -347,14 +389,23 @@ class body_charge_model:
                             linewidth=0,
                             edgecolor='none',)
         else:
+            # Reshape
+            assert fields.shape[0] == self.num_us * self.num_vs
+            fields = fields.reshape(self.num_us, self.num_vs, *fields.shape[1:])
+            
             # Use field norm for color
-            vals = fields.norm(dim=-1).cpu()
+            if fields.shape == xs.shape:
+                vals = fields.cpu()
+            elif fields.shape == xs.shape + (3,):
+                vals = fields.norm(dim=-1).cpu()
+            else:
+                raise ValueError(f'Invalid fields shape: {fields.shape}')
             if vmin is None:
-                vmin = 0
+                vmin = vals.min()
             if vmax is None:
-                vmax = vals.abs().max()
+                vmax = vals.max()
             norm = plt.Normalize(vmin, vmax)
-            colormap = cm.jet
+            colormap = cm.get_cmap(cmap)
             colors = colormap(norm(vals))
             sm = cm.ScalarMappable(norm=norm, cmap=colormap)
             
@@ -367,8 +418,9 @@ class body_charge_model:
                             shade=True, 
                             linewidth=0,
                             edgecolor='none',)
-            cbar = fig.colorbar(sm, ax=ax)
-            cbar.set_label(colorbar_label)
+            if colorbar_label is not None:
+                cbar = fig.colorbar(sm, ax=ax)
+                cbar.set_label(colorbar_label)
             
         # set equal aspect
         set_axes_equal(ax)
@@ -377,25 +429,38 @@ class body_charge_model:
 
     def _vbases(self,
                 v: torch.Tensor,
-                n: torch.Tensor) -> torch.Tensor:
+                n: torch.Tensor,
+                rescale_v: bool = True) -> torch.Tensor:
         """
         Hat functions in longitudinal direction
         """
+        if rescale_v:
+            v_rs = (v - v.min()) / (v.max() - v.min())
+        else:
+            v_rs = v
         N = self.N - 1
-        mask = (v - n / N).abs() <= 1 / N
-        v_bases = 1 - (N * v - n).abs()
+        mask = (v_rs - n / N).abs() <= 1 / N
+        v_bases = 1 - (N * v_rs - n).abs()
         return v_bases * mask.float()
     
     def _ubases(self,
                 u: torch.Tensor,
-                m: torch.Tensor,) -> torch.Tensor:
+                m: torch.Tensor,
+                cos_only: bool = False,
+                sin_only: bool = False) -> torch.Tensor:
         """
         Fourier modes in azimuthal direction
         """
-        u_cos = torch.cos(m * u)
-        u_sin = torch.sin(m * u)
-        u_bases = torch.stack([u_cos, u_sin], dim=0)
-        return u_bases
+        assert not (cos_only and sin_only), "Only one of cos_only or sin_only can be True"
+        if cos_only:
+            return torch.cos(m * u)
+        if sin_only:
+            return torch.sin(m * u)
+        
+        u_cos = torch.cos((m//2) * u)
+        u_sin = torch.sin((m//2) * u)
+        mask = 1 * (m % 2 == 0)
+        return u_cos * mask + u_sin * (1 - mask)
            
     def _gen_surface_pts(self,
                          ulin: torch.Tensor,
@@ -439,8 +504,8 @@ class body_charge_model:
         duv_crds = torch.stack([du, dv], dim=-1)
         
         # Generate surface coordinates and normals
-        xyz_crds = uv_to_xyz(us, vs) * 1e-3 # m
-        tang_surf = dxyz_duv(us, vs) * 1e-3 # m
+        xyz_crds = uv_to_xyz(us, vs) * MM_TO_M # m
+        tang_surf = dxyz_duv(us, vs) * MM_TO_M # m
         normals = torch.cross(tang_surf[:, 0, :], tang_surf[:, 1, :], dim=-1)
         areas = torch.linalg.norm(normals, axis=-1) * duv_crds.prod(dim=-1)
         normals = normals / areas[:, None]

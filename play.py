@@ -5,10 +5,10 @@ import matplotlib
 matplotlib.use('WebAgg')
 import matplotlib.pyplot as plt
 
-from magopt.gradient_coils import matrix_coil, circular_z_coil, elliptical_frustum
+from magopt.gradient_coils import matrix_coil, circular_z_coil
 from magopt.utils import gen_grd
 from magopt.sim.analytic import calc_bfield_loop 
-from magopt.sim.elip import EllipELookup, EllipKLookup
+from magopt.sim.elliptic_lookup import EllipELookup, EllipKLookup
 from magopt.optim_admm import (
     admm_general,
     unrolled_admm_general,
@@ -45,7 +45,7 @@ def gen_pts_cylinder(Nrad, Nz):
     return pts
 
 # Params
-torch_dev = torch.device(5)
+torch_dev = torch.device(3)
 fov = 0.22 # m (field of view)
 R = 0.05 # m (radius of loop)
 Rbody = 0.1 # m (radius of body)
@@ -96,18 +96,19 @@ grad_coil = matrix_coil(radii=radii,
 # grad_coil = circular_z_coil(zs=zs, zs_spline=zs_spline, rs_spline=rs_spline,
 #                             M_fourier_modes=10)
 def G_theta(thetas):
-    G, _, _ = grad_coil.build_field_matrices(crds_gfield=crds_grad, crds_bfield=crds_body[:1], crds_efield=crds_body[:1])
-    return G[grad_dir] * 1e3 # T/m -> mT/m
+    _, G, _ = grad_coil.build_field_matrices(crds_gfield=crds_grad, crds_bfield=crds_body[:1], crds_efield=crds_body[:1])
+    return G[..., grad_dir] * 1e3 # T/m -> mT/m
 def L_theta(thetas):
     L =  grad_coil.build_magnetic_energy_matrix()
     if isinstance(grad_coil, matrix_coil):
         L = L / Ncoils
+    L = L * 1e3 # H -> mH
     Lfact = torch.linalg.cholesky(L + 1e-12 * torch.eye(L.shape[0], device=torch_dev)).T
     return Lfact
 def E_theta(thetas):
     _, _, E = grad_coil.build_field_matrices(crds_gfield=crds_grad[:1], crds_bfield=crds_body[:1], crds_efield=crds_body)
     E = E * 1e3 / 1e-3 # s V/m -> mV/m/kHz
-    return E.moveaxis(0, 1) # 3 N Ncoeff -> N 3 Ncoeff
+    return E.moveaxis(-1, 1) # N Ncoeff 3 -> N 3 Ncoeff
 def C_theta(thetas):
     return None
 G = G_theta([])
@@ -116,20 +117,22 @@ E = E_theta([])
 
 # ADMM arguments
 admm_kwargs = {
-    # 'lamdaG': 1e1,
-    'Gmin': 1,
+    # 'lamdaG': 3e1,
+    'Gmin': 1.0,
     # 'lamdaL': 1e-3,
     'Lmax': 100_000e-6,
     'lamdaE': 1e0,
     # 'Emax': 8,
     # 'linearity_pcnt': 0.1,
+    'verbose': False,
     'rho_adapt': True,
+    'log_data': True,
 }
-surface_opt = False
+surface_opt = True
 
 if not surface_opt:
     dct = admm_general(G=G, L=L, E=E,
-                       admm_iters=500,
+                       admm_iters=500*5,
                        **admm_kwargs)
 else:
     grad_coil.radii.requires_grad = True
@@ -139,7 +142,7 @@ else:
     # grad_coil.zofs.requires_grad = True
     thetas = [
         grad_coil.radii,
-        grad_coil.centers,
+        # grad_coil.centers,
         grad_coil.thetas_phis,
         # grad_coil.spline.coeff,
         # grad_coil.zofs,
@@ -154,21 +157,32 @@ else:
     grad_coil.thetas_phis.requires_grad = False  
     # grad_coil.spline.coeff.requires_grad = False
     # grad_coil.zofs.requires_grad = False
-Gtarg = dct['Gmin']
+Gtarg = dct['Gmin'][-1]
 Gtarg_actual = (G_theta([]) @ dct['x']).min().item()
 print(f"Target Gradient = {Gtarg:.2f}mT/m")
 print(f"Actual Gradient = {Gtarg_actual:.2f}mT/m")
-Epeak = dct['Emax']
+Epeak = dct['Emax'][-1]
 Epeak_actual = (E_theta([]) @ dct['x']).norm(dim=-1).max().item()
 print(f"Target Peak Efield = {Epeak:.2f}mV/m/kHz")
 print(f"Actual Peak Efield = {Epeak_actual:.2f}mV/m/kHz")
-Lpeak = dct['Lmax']
-print(f"Inductance = {2e6*Lpeak:.2f} uH")
+Lpeak = dct['Lmax'][-1]
+print(f"Inductance = {1e3*Lpeak:.2f} uH")
+print(f'Rhos')
+for key in dct:
+    if 'rho' in key:
+        print(f'{key}: {dct[key]:1.3e}')
 
 # Plot diagnostics
 plt.figure()
-plt.plot(dct['r_pri'], label='Primal Residual')
-plt.plot(dct['s_dual'], label='Dual Residual')
+plt.semilogy(dct['r_pri'], label='Primal Residual')
+plt.semilogy(dct['s_dual'], label='Dual Residual')
+plt.legend()
+
+plt.figure(figsize=(14, 7))
+for i, key in enumerate(['Gmin', 'Lmax', 'Emax']):
+    plt.subplot(3, 1, i+1)
+    plt.plot(torch.tensor(dct[key]).cpu())
+    plt.ylabel(key)
 plt.legend()
 
 # Show Coil
@@ -176,14 +190,14 @@ fig, ax, axl = grad_coil.show_design(coeffs=dct['x'])
 
 amax = dct['x'].abs().argmax()
 val = dct['x'][amax].item()
-dct['x'] *= 0
-dct['x'][1] = val / 2
+# dct['x'] *= 0
+# dct['x'][1] = val / 2
 
 # Show fields
-G, B, E = grad_coil.build_field_matrices(crds_gfield=crds_flt, crds_bfield=crds_flt, crds_efield=crds_flt)
-Gz = einsum(G[grad_dir], dct['x'], 'N X, X -> N').reshape(im_size).cpu()
-Bfield = einsum(B[-1], dct['x'], 'N X, X -> N').reshape(im_size).cpu()
-Efield = einsum(E, dct['x'], 'd N X, X -> d N').norm(dim=0).reshape(im_size).cpu()
+B, G, E = grad_coil.build_field_matrices(crds_gfield=crds_flt, crds_bfield=crds_flt, crds_efield=crds_flt)
+Gz = einsum(G[..., grad_dir], dct['x'], 'N X, X -> N').reshape(im_size).cpu()
+Bfield = einsum(B[..., -1], dct['x'], 'N X, X -> N').reshape(im_size).cpu()
+Efield = einsum(E, dct['x'], 'N X d, X -> d N').norm(dim=0).reshape(im_size).cpu()
 grad_axis = ['x', 'y', 'z'][grad_dir]
 nslices = 3
 if grad_dir == 0 or grad_dir == 1:
