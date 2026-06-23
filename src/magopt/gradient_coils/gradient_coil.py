@@ -43,6 +43,17 @@ class gradient_coil:
         """
         raise NotImplementedError("Subclass must implement build_field_matrices")
     
+    def get_num_coeffs(self) -> int:
+        """
+        Returns the number of coil coefficients.
+        
+        Returns
+        -------
+        int
+            The number of coil coefficients.
+        """
+        raise NotImplementedError("Subclass must implement get_num_coeffs")
+    
     def show_design(self) -> None:
         """
         Visualizes the coil design.

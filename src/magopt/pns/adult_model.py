@@ -14,61 +14,90 @@ anatomy_params = {
     "Rx0": {  # x ellipse radii shoulder
         "Male": {"2.5": 203.0, "50": 225.0, "97.5": 246.5, 'safe': 246.5},
         "Female": {"2.5": 183.0, "50": 203.0, "97.5": 225.0},
+        "7y0": {"max": 150.0},
+        "1yo": {"max": 100.0},
     },
     "Rx1": {  # x ellipse radii neck
         "Male": {"2.5": 53.5, "50": 58.5, "97.5": 63.5, 'safe': 90.0},
         "Female": {"2.5": 51.7, "50": 55.9, "97.5": 60.2},
+        "7y0": {"max": 45},
+        "1yo": {"max": 30},
     },
     "Rx2": {  # x ellipse radii head
         "Male": {"2.5": 72.5, "50": 77.5, "97.5": 82.5, 'safe': 110.0},
         "Female": {"2.5": 72.5, "50": 72.5, "97.5": 77.5},
+        "7y0": {"max": 70},
+        "1yo": {"max": 50},
     },
     "Ry0": {  # y ellipse radii torso
         "Male": {"2.5": 98.0, "50": 114.5, "97.5": 136.0, 'safe': 136.0},
         "Female": {"2.5": 97.0, "50": 107.0, "97.5": 117.0},
+        "7y0": {"max": 100.0},
+        "1yo": {"max": 75.0},
     },
     "Ry1": {  # y ellipse radii neck
         "Male": {"2.5": 57.2, "50": 61.2, "97.5": 66.7, 'safe': 90.0},
         "Female": {"2.5": 51.7, "50": 55.9, "97.5": 60.2},
+        "7y0": {"max": 45},
+        "1yo": {"max": 30},
     },
     "Ry2": {  # y ellipse radii head
         "Male": {"2.5": 92.5, "50": 98.0, "97.5": 104.0, 'safe': 110.0},
         "Female": {"2.5": 91.5, "50": 92.5, "97.5": 98.0},
+        "7y0": {"max": 100},
+        "1yo": {"max": 75},
     },
     "L0": {  # z lengths body endcap
         "Male": {"2.5": 50.0, "50": 50.0, "97.5": 50.0, 'safe': 50.0},
         "Female": {"2.5": 50.0, "50": 50.0, "97.5": 50.0},
+        "7y0": {"max": 50},
+        "1yo": {"max": 50},
     },
     "L1": {  # z lengths body straight section
         "Male": {"2.5": 252.3, "50": 235.0, "97.5": 219.0, 'safe': 219.0},
         "Female": {"2.5": 267.3, "50": 249.0, "97.5": 231.8},
+        "7y0": {"max": 500},
+        "1yo": {"max": 500},
     },
     "L2": {  # z lengths body/neck transition
         "Male": {"2.5": 150.5, "50": 164.0, "97.5": 173.0, 'safe': 173.0},
         "Female": {"2.5": 142.5, "50": 157.0, "97.5": 170.5},
+        "7y0": {"max": 114},
+        "1yo": {"max": 114},
     },
     "L3": {  # z lengths neck/head transition
         "Male": {"2.5": 97.3, "50": 101.0, "97.5": 108.0, 'safe': 108.0},
         "Female": {"2.5": 90.3, "50": 94.0, "97.5": 97.8},
+        "7y0": {"max": 72},
+        "1yo": {"max": 72},
     },
     "L4": {  # z lengths top of head
         "Male": {"2.5": 97.3, "50": 101.0, "97.5": 108.0, 'safe': 108.0},
         "Female": {"2.5": 90.3, "50": 94.0, "97.5": 97.8},
+        "7y0": {"max": 85},
+        "1yo": {"max": 85},
     },
     "ZBC": {  # z brain center (relative to top of head)
         "Male": {"2.5": -97.3, "50": -101.0, "97.5": -108.0, 'safe': -108.0},
         "Female": {"2.5": -90.3, "50": -94.0, "97.5": -97.8},
+        "7y0": {"max": -85},
+        "1yo": {"max": -85},
     },
     "ZEC": {  # z eye center (relative to top of head)
         "Male": {"2.5": -102.0, "50": -112.0, "97.5": -119.0, 'safe': -119.0},
         "Female": {"2.5": -102.0, "50": -112.0, "97.5": -119.0},
+        "7y0": {"max": -90},
+        "1yo": {"max": -90},
     },
 }
 
 # Grab parameters for specific gender and percentile
-gender = "Male"
+# gender = "Male"
+gender = "7y0"
+# gender = "1yo"
 # percentile = "97.5"
-percentile = "safe"
+# percentile = "safe"
+percentile = "max"
 Rx0 = anatomy_params['Rx0'][gender][percentile]
 Rx1 = anatomy_params['Rx1'][gender][percentile]
 Rx2 = anatomy_params['Rx2'][gender][percentile]

@@ -37,6 +37,9 @@ class matrix_coil(gradient_coil):
         self.elip_e = EllipELookup().to(radii.device)
         self.elip_k = EllipKLookup().to(radii.device)
     
+    def get_num_coeffs(self) -> int:
+        return len(self.radii)
+    
     def _get_normals(self) -> torch.Tensor:
         """
         Gets the normals of the coil loops.
@@ -384,8 +387,9 @@ class matrix_coil(gradient_coil):
             ax.plot(crds_loop_new[..., 0], 
                     crds_loop_new[..., 1], 
                     crds_loop_new[..., 2], 
-                    color=colors,
-                    # color='black',
+                    # color=colors,
+                    color='red',
+                    alpha=0.1,
                     )
             
         ax.axis('equal')

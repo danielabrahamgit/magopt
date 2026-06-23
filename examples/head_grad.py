@@ -4,6 +4,7 @@ import matplotlib
 matplotlib.use('WebAgg')
 import matplotlib.pyplot as plt
 
+from tqdm import tqdm
 from magopt.viz import show_3d_slices
 from magopt.utils import gen_pts_sphere_surf, gen_pts_ellip_surf_random, gen_grd
 from magopt.pns.charge_model import body_charge_model
@@ -24,9 +25,9 @@ from typing import Optional
 from einops import einsum
 
 # Parameters
-torch_dev = torch.device(5)
+torch_dev = torch.device(0)
 grd_size = (51,)*3
-dsv = 0.0835 # * 2.4 # m (diameter of spherical volume to optimize over)
+dsv = 0.0835 * 2 # m (diameter of spherical volume to optimize over)
 grad_dir = 2 # 0 --> x, 1 --> y, 2 --> z
 GRAD_UNITS = 1e3 # T -> mT
 BFIELD_UNITS = 1e3 # T -> mT
@@ -38,20 +39,20 @@ min_wire_spacing = 1e-3 # m (minimum wire spacing)
 dstream = 1 # A (stream function step size AKA current through coil)
 opt_surface = False
 maxwell_pair = False
-use_head_surf = False
+use_head_surf = True
 # gradient_type = 'stream'
 # gradient_type = 'matrix'
 gradient_type = 'circular_z'
 admm_kwargs = {
     # 'lamdaG': 1e0,
     'Gmin': 1.0,
-    # 'lamdaL': 3e1,
-    'Lmax': 0.15/2, # mH
+    # 'lamdaL': 1e0,
+    'Lmax': 0.35, # mH
     'lamdaE': 1e0,
     # 'Emax': 5,
     # 'linearity_pcnt': 0.1,
     'rho': 1e-2,
-    'rho_adapt': False,
+    'rho_adapt': True,
     'log_data': True,
     'verbose': not opt_surface,
 }
@@ -116,23 +117,23 @@ if gradient_type == 'stream':
     # zs_spline = torch.linspace(z_start, z_end, nspline, device=torch_dev).flip(dims=[0])
     # phis = torch.arccos(zs_spline / grad_radius)
     # as_spline = grad_radius * torch.sin(phis)
-    # grad_coil = stream_func_coil(zs_spline=zs_opt,
-    #                              as_spline=as_opt,
-    # 							 num_z_modes=7,
-    # 							 num_theta_modes=7,
-    # 							#  z_bases='fourier',
-    # 							 z_bases='chebyshev',
-    # 							 theta_bases='fourier',)
-    surf = elliptical_frustum(zs_spline=zs_opt, 
-                              as_spline=as_opt,
-                              bs_spline=as_opt)
-    grad_coil = stream_func_surface_coil(surf, 
-                                         num_v_modes=7,
-                                         num_u_modes=7,
-                                         u_bases='fourier',
-                                         v_bases='chebyshev',
-                                         device=torch_dev,
-                                         dtype=torch.float32)
+    grad_coil = stream_func_coil(zs_spline=zs_opt,
+                                 as_spline=as_opt,
+    							 num_z_modes=15,
+    							 num_theta_modes=1,
+    							 z_bases='fourier',
+    							#  z_bases='chebyshev',
+    							 theta_bases='fourier',)
+    # surf = elliptical_frustum(zs_spline=zs_opt, 
+    #                           as_spline=as_opt,
+    #                           bs_spline=as_opt)
+    # grad_coil = stream_func_surface_coil(surf, 
+    #                                      num_v_modes=7,
+    #                                      num_u_modes=7*0+1,
+    #                                      u_bases='fourier',
+    #                                      v_bases='chebyshev',
+    #                                      device=torch_dev,
+    #                                      dtype=torch.float32)
     Ncoeffs = grad_coil.M * grad_coil.K
 elif gradient_type == 'matrix':
     loop_radius = .08
@@ -166,7 +167,7 @@ elif gradient_type == 'circular_z':
         zs_spline=zs_opt,
         rs_spline=as_opt,
         lamda_spline=1e-2,
-        M_fourier_modes=10,
+        M_fourier_modes=15,
         maxwell_pair=maxwell_pair,
     )
     Ncoeffs = grad_coil.Imat.shape[1]
@@ -178,7 +179,7 @@ def G_theta(thetas):
 def L_theta(thetas):
     W = grad_coil.build_magnetic_energy_matrix() * INDUCTANCE_UNITS
     L = 0.5 * W / (dstream ** 2) # Inductance from energy formula
-    eps = 1e-12
+    eps = 1e-9
     L = torch.linalg.cholesky(L + eps * torch.eye(W.shape[0], device=torch_dev)).T
     return L
 def E_theta(thetas):
@@ -307,6 +308,21 @@ def coeff_opt(state_dict=None):
     # dct['x'] = dct['x'] * (admm_kwargs['Lmax'] / (L @ dct['x']).norm().square().item()) ** 0.5
     return dct
 
+if opt_surface:
+    dct = surf_opt()
+    # dct = coeff_opt(state_dict=dct)
+    G = G_theta([])
+    L = L_theta([])
+    # E = E_theta_total([])
+    E = E_theta([])
+    F = F_theta([])
+    g = torch.zeros(F.shape[0], device=torch_dev)
+    P = P_theta([])
+    C = C_theta([])
+    d = d_theta([])
+else:
+    dct = coeff_opt()
+
 # Recompute E at shifted coordinates
 print('SHIFTING in X')
 crds_pns_old = crds_pns.clone()
@@ -314,11 +330,6 @@ crds_pns[..., 2] += 3e-2
 E = E_theta_total([])
 crds_pns = crds_pns_old.clone()
 
-if opt_surface:
-    dct = surf_opt()
-    dct = coeff_opt(state_dict=dct)
-else:
-    dct = coeff_opt()
 Gmin_actual = (G @ dct["x"]).min().item()
 Lmax_actual = (L @ dct["x"]).norm().square().item()
 Emax_actual = (E @ dct["x"]).norm(dim=-1).max().item()
@@ -338,62 +349,61 @@ for key in dct:
 	if 'rho' in key:
 		print(f'{key}: {dct[key]:1.3e}')
 
-# # Plot G distribution
-# plt.hist((G @ dct['x']).cpu(), bins=torch.linspace(0, 6, 100))
+# Plot G distribution
+plt.hist((G @ dct['x']).cpu(), bins=torch.linspace(0, 6, 100))
 try:
     gmin_targ = dct['Gmin'][-1].item()
 except:
-    gmin_targ = admm_kwargs['Gmin']
-    
-# plt.axvline(gmin_targ, color='r', linestyle='--')
+    gmin_targ = admm_kwargs['Gmin']  
+plt.axvline(gmin_targ, color='r', linestyle='--')
 
-# # Plot diagnostics
-# plt.figure()
-# plt.semilogy(dct['r_pri'], label='Primal Residual')
-# plt.semilogy(dct['s_dual'], label='Dual Residual')
-# plt.legend()
+# Plot diagnostics
+plt.figure()
+plt.semilogy(dct['r_pri'], label='Primal Residual')
+plt.semilogy(dct['s_dual'], label='Dual Residual')
+plt.legend()
 
-# plt.figure(figsize=(14, 7))
-# for i, key in enumerate(['Gmin', 'Lmax', 'Emax']):
-# 	plt.subplot(3, 1, i+1)
-# 	plt.plot(torch.tensor(dct[key]).cpu())
-# 	plt.ylabel(key)
-# plt.legend()
+plt.figure(figsize=(14, 7))
+for i, key in enumerate(['Gmin', 'Lmax', 'Emax']):
+	plt.subplot(3, 1, i+1)
+	plt.plot(torch.tensor(dct[key]).cpu())
+	plt.ylabel(key)
+plt.legend()
 
-# # Show winding 
-# if gradient_type == 'stream':
-#     fig, ax = grad_coil.show_countour(stream_coeffs=dct['x'], dstream=dstream)
-#     # ax.scatter(crds_pns[:, 0].cpu() * 1e2, crds_pns[:, 1].cpu() * 1e2, crds_pns[:, 2].cpu() * 1e2, color='orange', marker='.', alpha=0.1)
-#     # ax.scatter(crds_dsv[:, 0].cpu() * 1e2, crds_dsv[:, 1].cpu() * 1e2, crds_dsv[:, 2].cpu() * 1e2, color='green', marker='.', alpha=0.05)
-#     # fig, ax = grad_coil.show_current_density(stream_coeffs=dct['x'], num_theta=50, num_z=50)
-#     # ax.axis('off')
-#     bcm.show_surface(alpha=0.5, 
-#                     ax=ax, fig=fig,)
-# elif gradient_type == 'matrix':
-#     fig, ax, axl = grad_coil.show_design(coeffs=dct['x'])
-#     bcm.show_surface(alpha=0.5, 
-#                     ax=ax, fig=fig,)
-# elif gradient_type == 'circular_z':
-#     fig, ax, axl = grad_coil.show_design(coeffs=dct['x'])
-#     bcm.show_surface(alpha=0.5, 
-#                     ax=ax, fig=fig,)
+# Show winding 
+if gradient_type == 'stream':
+    fig, ax = grad_coil.show_countour(stream_coeffs=dct['x'], dstream=dstream)
+    # ax.scatter(crds_pns[:, 0].cpu() * 1e2, crds_pns[:, 1].cpu() * 1e2, crds_pns[:, 2].cpu() * 1e2, color='orange', marker='.', alpha=0.1)
+    # ax.scatter(crds_dsv[:, 0].cpu() * 1e2, crds_dsv[:, 1].cpu() * 1e2, crds_dsv[:, 2].cpu() * 1e2, color='green', marker='.', alpha=0.05)
+    # fig, ax = grad_coil.show_current_density(stream_coeffs=dct['x'], num_theta=50, num_z=50)
+    # ax.axis('off')
+    bcm.show_surface(alpha=0.5, 
+                    ax=ax, fig=fig,)
+elif gradient_type == 'matrix':
+    fig, ax, axl = grad_coil.show_design(coeffs=dct['x'])
+    bcm.show_surface(alpha=0.5, 
+                    ax=ax, fig=fig,)
+elif gradient_type == 'circular_z':
+    fig, ax, axl = grad_coil.show_design(coeffs=dct['x'])
+    bcm.show_surface(alpha=0.5, 
+                    ax=ax, fig=fig,)
 
 
-# # Show PNS surface
-# efield_surf = E @ dct['x']
-# fig, ax = bcm.show_surface(alpha=1.0, 
-#                  fields=efield_surf, 
-#                 #  ax=ax, fig=fig,
-#                  colorbar_label=r'$||E||_2$ Per Unit Slew (mV/m / (T/m/s))',
-#                  vmin=0, vmax=5)
-# ax.axis('off')
+# Show PNS surface
+efield_surf = E @ dct['x']
+fig, ax = bcm.show_surface(alpha=1.0, 
+                 fields=efield_surf, 
+                #  ax=ax, fig=fig,
+                 colorbar_label=r'$||E||_2$ Per Unit Slew (mV/m / (T/m/s))',
+                 vmin=0, vmax=7)
+ax.axis('off')
 
-# # Show stream function
-# if gradient_type == 'stream':
-#     fig, ax = grad_coil.show_design(coeffs=dct['x'],
-#                                     show_1d=False,
-#                                     colorbar=False)
-#     ax.axis('off')
+# Show stream function
+if gradient_type == 'stream':
+    fig, ax = grad_coil.show_design(coeffs=dct['x'],
+                                    show_1d=False,
+                                    colorbar=False)
+    ax.axis('off')
 
 # Compute field using stream function 
 crds_plt = gen_grd((101, 1, 101), (xrange, yrange, zrange)).to(torch_dev)[:, 0, :]
@@ -401,12 +411,31 @@ crds_plt = gen_grd((101, 1, 101), (xrange, yrange, zrange)).to(torch_dev)[:, 0, 
 crds_plt -= crds_plt.reshape((-1,3)).mean(dim=0)
 bfield, gfield, efield = grad_coil.evaluate_fields(coeffs=dct['x'], crds_bfield=crds_plt, crds_gfield=crds_plt, crds_efield=crds_plt)
 linpcnt = admm_kwargs['linearity_pcnt'] if 'linearity_pcnt' in admm_kwargs else None
-torch.save(bfield[..., -1].cpu(), f'./designs/bfield_linpcnt={linpcnt}_dsv={dsv*1e2:.0f}cm.pt')
-# quit()
-# bfield, gfield, efield = grad_coil.build_field_matrices(crds_bfield=crds_plt, crds_gfield=crds_plt, crds_efield=crds_plt)
-# bfield = einsum(bfield, dct['x'], '... C d, C -> ... d')
-# gfield = einsum(gfield, dct['x'], '... C d, C -> ... d')
-# efield = einsum(efield, dct['x'], '... C d, C -> ... d')
+# torch.save(bfield[..., -1].cpu(), f'./designs/bfield_linpcnt={linpcnt}_dsv={dsv*1e2:.0f}cm.pt')
+
+# # evaluate E-field at shifted coordinates
+# Nx, Nz = 50, 50
+# dx = 3e-2
+# dz = 3e-2
+# dxs = torch.linspace(-dx, dx, Nx, device=torch_dev)
+# dzs = torch.linspace(-dz, dz, Nz, device=torch_dev)
+# DX, DZ = torch.meshgrid(dxs, dzs, indexing='ij')
+# shifts = torch.stack([DX, DX*0, DZ], dim=-1)
+# crds_all = crds_pns[:, None, None, :] + shifts
+# peaks = DX * 0
+# for nx in tqdm(range(Nx), desc='Evaluating E-field at shifted coordinates'):
+#     for nz in range(Nz):
+#         crds_all = crds_pns + shifts[nx, nz, :]
+#         efield_all = grad_coil.evaluate_fields(coeffs=dct['x'], crds_bfield=crds_all[:1], crds_gfield=crds_all[:1], crds_efield=crds_all)[2]
+#         peaks[nx, nz] = efield_all.norm(dim=-1).max().item() * EFIELD_UNITS / FREQ_UNITS / dstream
+# plt.figure()
+# plt.imshow(peaks.cpu().rot90(), cmap='Reds', 
+#            extent=[-dx*1e2, dx*1e2, -dz*1e2, dz*1e2],
+#            vmin=0, vmax=10)
+# plt.xlabel(r'$\Delta X$ [cm]')
+# plt.ylabel(r'$\Delta Z$ [cm]')
+# plt.colorbar()
+        
 
 # # Show gradient slices
 # xrange = 0.15 * 2.3
@@ -473,9 +502,9 @@ cmaps = ['jet', 'RdBu_r', 'Reds']
 extent = [crds_plt[..., 0].min().item() * 1e2, crds_plt[..., 0].max().item() * 1e2,
 		  crds_plt[..., 2].min().item() * 1e2, crds_plt[..., 2].max().item() * 1e2]
 
-# Coil cross section
-zs = grad_coil.get_coil_zs()
-rs = grad_coil.interp_rs(zs)
+# # Coil cross section
+# zs = grad_coil.get_coil_zs()
+# rs = grad_coil.interp_rs(zs)
 
 # Plot fields
 I = len(fields)
@@ -494,8 +523,9 @@ for k in range(3):
 		plt.title(titles[k])
 		plt.xlabel('X [cm]')
 		plt.ylabel('Z [cm]')
-		plt.plot(rs.cpu() * 1e2, zs.cpu() * 1e2, color='black')
-		plt.plot(-rs.cpu() * 1e2, zs.cpu() * 1e2, color='black')
+		# plt.plot(rs.cpu() * 1e2, zs.cpu() * 1e2, color='black')
+		# plt.plot(-rs.cpu() * 1e2, zs.cpu() * 1e2, color='black')
+		plt.scatter(crds_pns[:, 0].cpu() * 1e2, crds_pns[:, 2].cpu() * 1e2, color='orange', marker='.', alpha=0.1)
 plt.tight_layout()
 plt.show()
 

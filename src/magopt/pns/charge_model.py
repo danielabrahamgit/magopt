@@ -64,7 +64,8 @@ class body_charge_model:
                  ulin: torch.Tensor,
                  vlin: torch.Tensor,
                  M_fourier_modes: int = 7,
-                 N_hat_modes: int = 50):
+                 N_hat_modes: int = 50,
+                 ofs: torch.Tensor = torch.tensor([0, 0, 0])):
         """
         Args
         ----
@@ -76,7 +77,8 @@ class body_charge_model:
             Number of Fourier modes in azimuthal direction
         N_hat_modes : int
             Number of hat functions in longitudinal direction
-        torch_dev : torch.device
+        ofs : torch.Tensor
+            Offset of the surface in the (x, y, z) directions
             Torch device to use (e.g. 'cpu' or 'cuda:0')
         """
         self.M = M_fourier_modes
@@ -86,6 +88,7 @@ class body_charge_model:
         # Generate surface points, normals, and areas for future use
         self.num_us = len(ulin)
         self.num_vs = len(vlin)
+        self.ofs = ofs.to(self.torch_dev)
         surface_quanities = self._gen_surface_pts(ulin, vlin)
         self.uv_crds  = surface_quanities[0]
         self.xyz_crds = surface_quanities[1]
@@ -505,6 +508,7 @@ class body_charge_model:
         
         # Generate surface coordinates and normals
         xyz_crds = uv_to_xyz(us, vs) * MM_TO_M # m
+        xyz_crds += self.ofs
         tang_surf = dxyz_duv(us, vs) * MM_TO_M # m
         normals = torch.cross(tang_surf[:, 0, :], tang_surf[:, 1, :], dim=-1)
         areas = torch.linalg.norm(normals, axis=-1) * duv_crds.prod(dim=-1)

@@ -4,11 +4,14 @@ Stream-function coil on a parametric surface r(u, v).
 This mirrors ``stream_func_coil`` but uses a :class:`~magopt.gradient_coils.gradient_surfaces.surface`
 instance for geometry. Parameters ``u`` and ``v`` are taken on a fixed interval (by default ``[0, 1]``
 for both), matching the convention in ``gradient_surfaces`` (e.g. ``elliptical_frustum``).
+
+1D stream-function bases come from :mod:`magopt.gradient_coils.surface_bases`: each basis family
+expects its argument scaled to ``[0, 1]`` (linear map from ``(u_min, u_max)`` or ``(v_min, v_max)``).
+For ``fourier``, ``num_u_modes`` / ``num_v_modes`` must be odd.
 """
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import numpy as np
@@ -22,19 +25,25 @@ from tqdm import tqdm
 
 from .gradient_coil import gradient_coil
 from .gradient_surfaces import surface
-from .stream_func_coil import (
+from .surface_bases import (
     _chebyshev_bases,
     _deriv_chebyshev_bases,
     _deriv_fourier_bases,
+    _deriv_triangular_bases,
     _fourier_bases,
+    _triangular_bases,
+    _gauss_bases,
+    _deriv_gauss_bases,
 )
 
 
 class stream_func_surface_coil(gradient_coil):
     """
     Current sheet on a surface parameterized by (u, v), with stream function
-    expanded in tensor products of 1D bases in u and v 
+    expanded in tensor products of 1D bases in u and v.
 
+    ``u_bases`` / ``v_bases`` may be ``"fourier"``, ``"chebyshev"``, or ``"triangular"`` (see
+    :mod:`magopt.gradient_coils.surface_bases`). Fourier mode counts must be odd.
     """
 
     def __init__(
@@ -71,30 +80,49 @@ class stream_func_surface_coil(gradient_coil):
         self.M = int(num_u_modes)
         self.K = int(num_v_modes)
 
-        self._ub = u_bases
-        self._vb = v_bases
+        # ``surface_bases`` expect coordinates in [0, 1]; physical (u, v) are mapped below.
 
-        # v bases (like z in stream_func_coil): index K
+        # v bases: index K
         if v_bases == "chebyshev":
             ks = torch.arange(self.K, device=self.torch_dev)
             self.v_bases = lambda x: _chebyshev_bases(x, self.K, ks)
             self.v_bases_deriv = lambda x: _deriv_chebyshev_bases(x, self.K, ks)
         elif v_bases == "fourier":
-            ks = torch.arange(int(math.ceil(self.K / 2)), device=self.torch_dev)
-            self.v_bases = lambda x: _fourier_bases(x * torch.pi, self.K, ks)
-            self.v_bases_deriv = lambda x: _deriv_fourier_bases(x * torch.pi, self.K, ks) * torch.pi
+            if self.K % 2 != 1:
+                raise ValueError("num_v_modes must be odd when v_bases='fourier' (see surface_bases._fourier_bases)")
+            ks = torch.arange((self.K + 1) // 2, device=self.torch_dev)
+            self.v_bases = lambda x: _fourier_bases(x, self.K, ks)
+            self.v_bases_deriv = lambda x: _deriv_fourier_bases(x, self.K, ks)
+        elif v_bases == "triangular":
+            ks = torch.arange(self.K, device=self.torch_dev)
+            self.v_bases = lambda x: _triangular_bases(x, self.K, ks)
+            self.v_bases_deriv = lambda x: _deriv_triangular_bases(x, self.K, ks)
+        elif v_bases == "gauss":
+            ks = torch.arange(self.K, device=self.torch_dev)
+            self.v_bases = lambda x: _gauss_bases(x, self.K, ks)
+            self.v_bases_deriv = lambda x: _deriv_gauss_bases(x, self.K, ks)
         else:
             raise ValueError(f"Invalid v_bases: {v_bases}")
 
-        # u bases (like theta in stream_func_coil): index M
+        # u bases: index M
         if u_bases == "fourier":
-            ms = torch.arange(int(math.ceil(self.M / 2)), device=self.torch_dev)
+            if self.M % 2 != 1:
+                raise ValueError("num_u_modes must be odd when u_bases='fourier' (see surface_bases._fourier_bases)")
+            ms = torch.arange((self.M + 1) // 2, device=self.torch_dev)
             self.u_bases = lambda x: _fourier_bases(x, self.M, ms)
             self.u_bases_deriv = lambda x: _deriv_fourier_bases(x, self.M, ms)
         elif u_bases == "chebyshev":
             ms = torch.arange(self.M, device=self.torch_dev)
             self.u_bases = lambda x: _chebyshev_bases(x, self.M, ms)
             self.u_bases_deriv = lambda x: _deriv_chebyshev_bases(x, self.M, ms)
+        elif u_bases == "triangular":
+            ms = torch.arange(self.M, device=self.torch_dev)
+            self.u_bases = lambda x: _triangular_bases(x, self.M, ms)
+            self.u_bases_deriv = lambda x: _deriv_triangular_bases(x, self.M, ms)
+        elif u_bases == "gauss":
+            ms = torch.arange(self.M, device=self.torch_dev)
+            self.u_bases = lambda x: _gauss_bases(x, self.M, ms)
+            self.u_bases_deriv = lambda x: _deriv_gauss_bases(x, self.M, ms)
         else:
             raise ValueError(f"Invalid u_bases: {u_bases}")
 
@@ -104,6 +132,9 @@ class stream_func_surface_coil(gradient_coil):
             device=self.torch_dev,
             dtype=torch.float32,
         )
+
+    def get_num_coeffs(self) -> int:
+        return self.M * self.K
 
     def _u_samples_1d(self, dtype: torch.dtype) -> torch.Tensor:
         """Half-open ``[u_min, u_max)`` grid with ``num_u`` steps, matching ``stream_func_coil`` theta sampling."""
@@ -131,26 +162,22 @@ class stream_func_surface_coil(gradient_coil):
     # ----- coordinate maps (parallel to theta / z in stream_func_coil) -----
 
     def _u_coord_for_bases(self, u: torch.Tensor) -> torch.Tensor:
-        if self._ub == "chebyshev":
-            return 2.0 * (u - self.u_min) / (self.u_max - self.u_min) - 1.0
-        # fourier (theta-style): map [u_min, u_max] -> [0, 2π)
-        return (u - self.u_min) / (self.u_max - self.u_min) * (2.0 * torch.pi)
+        """Map physical ``u`` in ``[u_min, u_max]`` to normalized coordinate in ``[0, 1]`` for ``surface_bases``."""
+        span = self.u_max - self.u_min
+        return (u - self.u_min) / span
 
     def _du_chain(self) -> float:
-        if self._ub == "chebyshev":
-            return 2.0 / (self.u_max - self.u_min)
-        return (2.0 * torch.pi) / (self.u_max - self.u_min)
+        """Chain factor ``d/du = (1 / span_u) * d/dx`` with ``x`` in ``[0, 1]``."""
+        return 1.0 / (self.u_max - self.u_min)
 
     def _v_coord_for_bases(self, v: torch.Tensor) -> torch.Tensor:
-        eta = 2.0 * (v - self.v_min) / (self.v_max - self.v_min) - 1.0
-        if self._vb == "chebyshev":
-            return eta
-        # v fourier (z-style): eta in [-1, 1] passed to inner fourier like stream_func_coil
-        return eta
+        """Map physical ``v`` in ``[v_min, v_max]`` to normalized coordinate in ``[0, 1]`` for ``surface_bases``."""
+        span = self.v_max - self.v_min
+        return (v - self.v_min) / span
 
     def _dv_chain(self) -> float:
-        # deta/dv for both chebyshev and fourier-on-eta (v-style)
-        return 2.0 / (self.v_max - self.v_min)
+        """Chain factor ``d/dv = (1 / span_v) * d/dx`` with ``x`` in ``[0, 1]``."""
+        return 1.0 / (self.v_max - self.v_min)
 
     # ----- surface geometry -----
 
@@ -208,7 +235,7 @@ class stream_func_surface_coil(gradient_coil):
         return combined_u, combined_v
 
     def _stream_function_surface_gradient(
-        self, u: torch.Tensor, v: torch.Tensor, stream_coeffs: torch.Tensor
+        self, u: torch.Tensor, v: torch.Tensor, coeffs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         uc = self._u_coord_for_bases(u)
         eta_v = self._v_coord_for_bases(v)
@@ -217,18 +244,18 @@ class stream_func_surface_coil(gradient_coil):
         vb = self.v_bases(eta_v)
         bu = vb[..., None] * ubd[..., None, :]
         bu = bu.reshape((*u.shape, -1))
-        dphi_du = bu @ stream_coeffs
+        dphi_du = bu @ coeffs
 
         vbd = self.v_bases_deriv(eta_v) * self._dv_chain()
         ub = self.u_bases(uc)
         bv = vbd[..., None] * ub[..., None, :]
         bv = bv.reshape((*u.shape, -1))
-        dphi_dv = bv @ stream_coeffs
+        dphi_dv = bv @ coeffs
 
         return dphi_du, dphi_dv
 
     def _stream_function(
-        self, u: torch.Tensor, v: torch.Tensor, stream_coeffs: torch.Tensor
+        self, u: torch.Tensor, v: torch.Tensor, coeffs: torch.Tensor
     ) -> torch.Tensor:
         uc = self._u_coord_for_bases(u)
         eta_v = self._v_coord_for_bases(v)
@@ -236,7 +263,7 @@ class stream_func_surface_coil(gradient_coil):
         ub = self.u_bases(uc)
         combined = vb[..., None] * ub[..., None, :]
         combined = combined.reshape((*u.shape, -1))
-        return combined @ stream_coeffs
+        return combined @ coeffs
 
     def _current_density_dS_bases(
         self, u: torch.Tensor, v: torch.Tensor, return_grad_phi: bool = False
@@ -270,7 +297,7 @@ class stream_func_surface_coil(gradient_coil):
         return js, ds_factor
 
     def _current_density_dS(
-        self, u: torch.Tensor, v: torch.Tensor, stream_coeffs: torch.Tensor
+        self, u: torch.Tensor, v: torch.Tensor, coeffs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         t_u, t_v = self._surface_tangent_vectors(u, v)
         tangent_stack = torch.stack([t_u, t_v], dim=-1)
@@ -278,7 +305,7 @@ class stream_func_surface_coil(gradient_coil):
         n, g_inv = self._normal_vector_and_ginv(t_u, t_v)
         n_hat = n / n.norm(dim=-1, keepdim=True)
 
-        dphi_du, dphi_dv = self._stream_function_surface_gradient(u, v, stream_coeffs)
+        dphi_du, dphi_dv = self._stream_function_surface_gradient(u, v, coeffs)
         dphi_stack = torch.stack([dphi_du, dphi_dv], dim=-1)
 
         grad_phi = tangent_stack @ (g_inv @ dphi_stack[..., None])
@@ -367,7 +394,7 @@ class stream_func_surface_coil(gradient_coil):
         _, _, winding_tol = self._current_density_dS_bases(u, v, return_grad_phi=True)
         return winding_tol
 
-    def build_current_boundary_matrix(self, verbose: bool = False) -> torch.Tensor:
+    def build_current_boundary_matrix(self) -> torch.Tensor:
         """Enforce ``J · t_v ≈ 0`` at ``v = v_min`` and ``v = v_max`` (u varying), mirroring z-boundaries in ``stream_func_coil``."""
         ncoeffs = self.M * self.K
         u = self._u_samples_1d(torch.float32)
@@ -378,7 +405,7 @@ class stream_func_surface_coil(gradient_coil):
 
         jmat = torch.zeros((ncoeffs, len(u_edges)), dtype=torch.float32, device=self.torch_dev)
         one_hot = torch.zeros(ncoeffs, device=self.torch_dev)
-        for c in tqdm(range(ncoeffs), "Building Field Matrix", disable=not verbose):
+        for c in tqdm(range(ncoeffs), "Building Current Boundary Matrix"):
             one_hot.zero_()
             one_hot[c] = 1.0
             
@@ -524,7 +551,7 @@ class stream_func_surface_coil(gradient_coil):
 
     def stream_to_contour(
         self,
-        stream_coeffs: torch.Tensor,
+        coeffs: torch.Tensor,
         num_u: int = 100,
         num_v: int = 200,
         dstream: Optional[float] = None,
@@ -532,7 +559,7 @@ class stream_func_surface_coil(gradient_coil):
         v = torch.linspace(self.v_min, self.v_max, num_v, device=self.torch_dev)
         u = torch.linspace(self.u_min, self.u_max, num_u, device=self.torch_dev)
         uu, vv = torch.meshgrid(u, v, indexing="ij")
-        stream = self._stream_function(uu, vv, stream_coeffs)
+        stream = self._stream_function(uu, vv, coeffs)
 
         if dstream is None:
             dstream = (stream.max() - stream.min()).item() / 100.0
@@ -564,7 +591,7 @@ class stream_func_surface_coil(gradient_coil):
         flipped = 0
         for i in range(len(xyz_contours)):
             uv_surf = theta_z_contours[i][:1]
-            j_surf, _ = self._current_density_dS(uv_surf[:, 0], uv_surf[:, 1], stream_coeffs)
+            j_surf, _ = self._current_density_dS(uv_surf[:, 0], uv_surf[:, 1], coeffs)
             tangent = xyz_contours[i][1] - xyz_contours[i][0]
             sign = torch.sign(j_surf.unsqueeze(0).cpu() @ tangent)
             if sign < 0:
@@ -575,7 +602,7 @@ class stream_func_surface_coil(gradient_coil):
 
     def show_countour(
         self,
-        stream_coeffs: torch.Tensor,
+        coeffs: torch.Tensor,
         num_u: int = 100,
         num_v: int = 50,
         dstream: Optional[float] = None,
@@ -591,7 +618,7 @@ class stream_func_surface_coil(gradient_coil):
         ax.set_zlabel("z (cm)")
         ax.set_aspect("equal")
 
-        xyz_contours, _d = self.stream_to_contour(stream_coeffs, num_u, num_v, dstream=dstream)
+        xyz_contours, _d = self.stream_to_contour(coeffs, num_u, num_v, dstream=dstream)
         for xyz_c in xyz_contours:
             ax.plot(
                 xyz_c[..., 0] * 1e2,
@@ -604,7 +631,7 @@ class stream_func_surface_coil(gradient_coil):
 
     def show_current_density(
         self,
-        stream_coeffs: torch.Tensor,
+        coeffs: torch.Tensor,
         num_u: int = 100,
         num_v: int = 50,
         fig: Optional[plt.Figure] = None,
@@ -618,7 +645,7 @@ class stream_func_surface_coil(gradient_coil):
         v = torch.linspace(self.v_min, self.v_max, num_v, device=self.torch_dev)
         u, v = torch.meshgrid(u, v, indexing="ij")
         crds = self._surface_positions(u, v)
-        js, _ = self._current_density_dS(u, v, stream_coeffs)
+        js, _ = self._current_density_dS(u, v, coeffs)
 
         crds = crds.reshape(-1, 3).cpu() * 1e2
         js = js.reshape(-1, 3).cpu()
@@ -678,12 +705,11 @@ class stream_func_surface_coil(gradient_coil):
             facecolors=colors,
             rcount=zs_map.shape[0],
             ccount=zs_map.shape[1],
-            alpha=alpha,
+            alpha=0.5,
             shade=False,
             linewidth=0,
             edgecolor="none",
         )
-        ax.set_aspect("equal")
 
         if colorbar:
             cbar = fig.colorbar(sm, ax=ax)

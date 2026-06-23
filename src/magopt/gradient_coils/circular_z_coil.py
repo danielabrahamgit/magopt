@@ -120,6 +120,9 @@ class circular_z_coil(gradient_coil):
         self.elip_e = EllipELookup().to(self.torch_dev)
         self.elip_k = EllipKLookup().to(self.torch_dev)
     
+    def get_num_coeffs(self) -> int:
+        return self.Imat.shape[1]
+    
     def get_coil_zs(self) -> torch.Tensor:
         return torch.linspace(self.zmin, self.zmax, self.N, device=self.torch_dev) + self.zofs
     
@@ -215,10 +218,10 @@ class circular_z_coil(gradient_coil):
 
     def show_design(self,
                     coeffs: torch.Tensor,
-                    alpha: float = 1.0,
+                    alpha: float = 0.5,
                     num_theta: int = 100,
-                    vmin: float = None,
-                    vmax: float = None) -> tuple[plt.Figure, plt.Axes, plt.Axes]:
+                    vmin: float = -6,
+                    vmax: float = +6) -> tuple[plt.Figure, plt.Axes, plt.Axes]:
         """
         Show the coil design.
 
@@ -277,6 +280,7 @@ class circular_z_coil(gradient_coil):
                         shade=True,
                         edgecolor='none',
                         linewidth=0)
+        ax.set_axis_off()
         cbar = fig.colorbar(sm, ax=ax)
         cbar.set_label('Current (A-turns)')
 

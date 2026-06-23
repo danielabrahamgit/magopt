@@ -207,6 +207,9 @@ class stream_func_coil(gradient_coil):
                                  [1, 0, 0], 
                                  [0, 0, 0]], device=self.torch_dev, dtype=torch.float32)
 
+    def get_num_coeffs(self) -> int:
+        return self.M * self.K
+    
     def _interp_surface_radii(self,
                               zs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -357,7 +360,7 @@ class stream_func_coil(gradient_coil):
     def _stream_function_surface_gradient(self,
                                           thetas: torch.Tensor,
                                           zs: torch.Tensor,
-                                          stream_coeffs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                                          coeffs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Computes the derivative of the stream function w.r.t. theta and z
 
@@ -367,7 +370,7 @@ class stream_func_coil(gradient_coil):
             Angular positions on the surface (...,)
         zs : torch.Tensor
             z positions on the surface (...,)
-        stream_coeffs : torch.Tensor
+        coeffs : torch.Tensor
             Stream basis coefficients with shape (Ncoeff,)
 
         Returns
@@ -384,7 +387,7 @@ class stream_func_coil(gradient_coil):
         zbs = self.z_bases(etas) # (..., K)
         combined_bases = zbs[..., None] * tbs_deriv[..., None, :] # ... K, M
         combined_bases = combined_bases.reshape((*zs.shape, -1))
-        dphi_dtheta = combined_bases @ stream_coeffs
+        dphi_dtheta = combined_bases @ coeffs
 
         # Gradient of stream function w.r.t. z
         zbs_deriv = self.z_bases_deriv(etas) # (..., K)
@@ -392,14 +395,14 @@ class stream_func_coil(gradient_coil):
         tbs = self.theta_bases(thetas) # (..., M)
         combined_bases = zbs_deriv[..., None] * tbs[..., None, :] # ... K, M
         combined_bases = combined_bases.reshape((*zs.shape, -1))
-        dphi_dz = combined_bases @ stream_coeffs # (..., Ncoeff)
+        dphi_dz = combined_bases @ coeffs # (..., Ncoeff)
 
         return dphi_dtheta, dphi_dz
 
     def _stream_function(self,
                          thetas: torch.Tensor,
                          zs: torch.Tensor,
-                         stream_coeffs: torch.Tensor) -> torch.Tensor:
+                         coeffs: torch.Tensor) -> torch.Tensor:
         """
         Computes the stream function phi(theta, z)
         
@@ -409,7 +412,7 @@ class stream_func_coil(gradient_coil):
             Angular positions on the surface (...,)
         zs : torch.Tensor
             z positions on the surface (...,)
-        stream_coeffs : torch.Tensor
+        coeffs : torch.Tensor
             Coefficients for the Chebyshev and Fourier expansions with shape (Ncoeff,)
             
         Returns
@@ -429,7 +432,7 @@ class stream_func_coil(gradient_coil):
         combined_bases = combined_bases.reshape((*zs.shape, -1))
         
         # Evaluate
-        return combined_bases @ stream_coeffs
+        return combined_bases @ coeffs
  
     def _current_density_dS_bases(self,
                                   thetas: torch.Tensor,
@@ -497,7 +500,7 @@ class stream_func_coil(gradient_coil):
     def _current_density_dS(self,
                             thetas: torch.Tensor,
                             zs: torch.Tensor,
-                            stream_coeffs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                            coeffs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Computes the current density vector at the given (theta, z) positions 
         and the dS factor for surface integration
@@ -508,7 +511,7 @@ class stream_func_coil(gradient_coil):
             Angular positions on the surface (...,)
         zs : torch.Tensor
             z positions on the surface (...,)
-        stream_coeffs : torch.Tensor
+        coeffs : torch.Tensor
             Coefficients for the Chebyshev and Fourier expansions with shape (Ncoeffs,)
             
         Returns
@@ -525,7 +528,7 @@ class stream_func_coil(gradient_coil):
         n_hat = n / n.norm(dim=-1, keepdim=True)
         
         # Get stream function gradients
-        dphi_dtheta, dphi_dz = self._stream_function_surface_gradient(thetas, zs, stream_coeffs)
+        dphi_dtheta, dphi_dz = self._stream_function_surface_gradient(thetas, zs, coeffs)
         dphi_stack = torch.stack([dphi_dtheta, dphi_dz], dim=-1) # (..., 2)
         
         # Compute current density
@@ -663,7 +666,7 @@ class stream_func_coil(gradient_coil):
         Matrix relating the stream function coefficients to the winding tolerance.
         We want the current to flow in the correct direction around the coil.
         
-        ||winding_tol @ stream_coeffs||_2 <= upper_bound
+        ||winding_tol @ coeffs||_2 <= upper_bound
         
         Args
         -----
@@ -690,8 +693,7 @@ class stream_func_coil(gradient_coil):
         
         return winding_tol
 
-    def build_current_boundary_matrix(self,
-                                      verbose: bool = False) -> torch.Tensor:
+    def build_current_boundary_matrix(self) -> torch.Tensor:
         """
         Matrix relating the stream function coefficients to the current boundary conditions.
         We want zero current to flow off the ends of the surface.
@@ -700,8 +702,6 @@ class stream_func_coil(gradient_coil):
         -----
         num_theta : int
             Number of theta points on the two boundaries to enforce zero exit current
-        verbose : bool
-            If True, print progress bars
         
         Returns
         -------
@@ -721,7 +721,7 @@ class stream_func_coil(gradient_coil):
         
         # Get current density at boundaries in normal direction
         one_hot = torch.zeros(Ncoeffs, device=self.torch_dev)
-        for c in tqdm(range(Ncoeffs), 'Building Field Matrix', disable=not verbose):
+        for c in tqdm(range(Ncoeffs), 'Building Current Boundary Matrix'):
             one_hot *= 0
             one_hot[c] = 1.0        
             
@@ -966,7 +966,7 @@ class stream_func_coil(gradient_coil):
 
     # TODO fix .cpu() calls by making interpolation on GPU
     def stream_to_contour(self,
-                          stream_coeffs: torch.Tensor,
+                          coeffs: torch.Tensor,
                           num_theta: int = 100,
                           num_z: int = 200,
                           dstream: Optional[float] = None,) -> tuple[list[torch.Tensor], float]:
@@ -975,7 +975,7 @@ class stream_func_coil(gradient_coil):
         
         Args
         ----
-        stream_coeffs : torch.Tensor
+        coeffs : torch.Tensor
             Coefficients for the Chebyshev and Fourier expansions with shape (Ncoeffs,)
         num_theta : int
             Number of theta points on the surface
@@ -995,7 +995,7 @@ class stream_func_coil(gradient_coil):
         thetas = torch.linspace(0, 2 * torch.pi, num_theta, device=self.torch_dev)
         # thetas = torch.arange(0, 2 * torch.pi, 2 * torch.pi / num_theta, device=self.torch_dev)
         TT, ZZ = torch.meshgrid(thetas, zs, indexing='ij') # (T, Z)
-        stream = self._stream_function(TT, ZZ, stream_coeffs) # (T, Z)
+        stream = self._stream_function(TT, ZZ, coeffs) # (T, Z)
 
         # Set default dstream
         if dstream is None:
@@ -1041,7 +1041,7 @@ class stream_func_coil(gradient_coil):
         flipped = 0
         for i in range(len(xyz_contours)):
             theta_zs_surf = theta_z_contours[i][:1]
-            J_surf, _ = self._current_density_dS(theta_zs_surf[:, 0], theta_zs_surf[:, 1], stream_coeffs)
+            J_surf, _ = self._current_density_dS(theta_zs_surf[:, 0], theta_zs_surf[:, 1], coeffs)
             tangent = xyz_contours[i][1] - xyz_contours[i][0]
             sign = torch.sign(J_surf.unsqueeze(0).cpu() @ tangent)
             if sign < 0:
@@ -1051,7 +1051,7 @@ class stream_func_coil(gradient_coil):
         return xyz_contours, dstream
     
     def stream_to_winding(self,
-                          stream_coeffs: torch.Tensor,
+                          coeffs: torch.Tensor,
                           num_theta: int = 100,
                           num_z: int = 200,
                           dstream: Optional[float] = None,) -> tuple[list[torch.Tensor], float]:
@@ -1060,7 +1060,7 @@ class stream_func_coil(gradient_coil):
         
         Args
         ----
-        stream_coeffs : torch.Tensor
+        coeffs : torch.Tensor
             Coefficients for the Chebyshev and Fourier expansions with shape (Ncoeffs,)
         num_theta : int
             Number of theta points on the surface
@@ -1081,7 +1081,7 @@ class stream_func_coil(gradient_coil):
         thetas = torch.linspace(0, 2 * torch.pi, num_theta, device=self.torch_dev)
         # thetas = torch.arange(0, 2 * torch.pi, 2 * torch.pi / num_theta, device=self.torch_dev)
         TT, ZZ = torch.meshgrid(thetas, zs, indexing='ij') # (T, Z)
-        stream = self._stream_function(TT, ZZ, stream_coeffs) # (T, Z)
+        stream = self._stream_function(TT, ZZ, coeffs) # (T, Z)
 
         # Set default dstream
         if dstream is None:
@@ -1164,7 +1164,7 @@ class stream_func_coil(gradient_coil):
         flipped = 0
         for i in range(len(xyz_contours)):
             theta_zs_surf = theta_z_contours[i][:1]
-            J_surf, _ = self._current_density_dS(theta_zs_surf[:, 0], theta_zs_surf[:, 1], stream_coeffs)
+            J_surf, _ = self._current_density_dS(theta_zs_surf[:, 0], theta_zs_surf[:, 1], coeffs)
             tangent = xyz_contours[i][1] - xyz_contours[i][0]
             sign = torch.sign(J_surf.unsqueeze(0).cpu() @ tangent)
             if sign < 0:
@@ -1175,7 +1175,7 @@ class stream_func_coil(gradient_coil):
         return xyz_contours, dstream
     
     def show_countour(self,
-                      stream_coeffs: torch.Tensor,
+                      coeffs: torch.Tensor,
                       num_theta: int = 100,
                       num_z: int = 50,
                       dstream: Optional[float] = None,
@@ -1186,7 +1186,7 @@ class stream_func_coil(gradient_coil):
         
         Args
         ----
-        stream_coeffs : torch.Tensor
+        coeffs : torch.Tensor
             Coefficients for the Chebyshev and Fourier expansions with shape (Ncoeffs,)
         num_theta : int
             Number of theta points on the surface
@@ -1219,13 +1219,13 @@ class stream_func_coil(gradient_coil):
         ax.set_aspect('equal')
         
         # Plot contours
-        xyz_contours, dstream = self.stream_to_contour(stream_coeffs, num_theta, num_z, dstream=dstream)
+        xyz_contours, dstream = self.stream_to_contour(coeffs, num_theta, num_z, dstream=dstream)
         for xyz_contour in xyz_contours:
             ax.plot(xyz_contour[..., 0] * 1e2, xyz_contour[..., 1] * 1e2, xyz_contour[..., 2] * 1e2, color='red', alpha=0.3)
         return fig, ax
         
     def show_current_density(self,
-                             stream_coeffs: torch.Tensor,
+                             coeffs: torch.Tensor,
                              num_theta: int = 100,
                              num_z: int = 50,
                              fig: Optional[plt.Figure] = None,
@@ -1235,7 +1235,7 @@ class stream_func_coil(gradient_coil):
         
         Args
         ----
-        stream_coeffs : torch.Tensor
+        coeffs : torch.Tensor
             Coefficients for the Chebyshev and Fourier expansions with shape (Ncoeffs,)
         num_theta : int
             Number of theta points on the surface
@@ -1257,7 +1257,7 @@ class stream_func_coil(gradient_coil):
         zs = torch.linspace(self.zmin, self.zmax, num_z, device=self.torch_dev)
         thetas, zs = torch.meshgrid(thetas, zs, indexing='ij') # (T, Z)
         crds = self._surface_positions(thetas, zs)
-        Js, _ = self._current_density_dS(thetas, zs, stream_coeffs)
+        Js, _ = self._current_density_dS(thetas, zs, coeffs)
         
         # Quiver plot
         crds = crds.reshape(-1, 3).cpu() * 1e2
@@ -1366,7 +1366,7 @@ class stream_func_coil(gradient_coil):
 # TODO build via analytic bases
 def test_fast_transforms(thetas: torch.Tensor,
                          zs: torch.Tensor,
-                         stream_coeffs: torch.Tensor,
+                         coeffs: torch.Tensor,
                          M_fourier: int = 10,
                          K_chebyshev: int = 10) -> torch.Tensor:
     assert zs.min().item() >= -1.0 and zs.max().item() <= 1.0, "zs must be in [-1, +1]"
@@ -1375,17 +1375,17 @@ def test_fast_transforms(thetas: torch.Tensor,
     ms = torch.arange(0, M_fourier, device=thetas.device)
     ks = torch.arange(0, K_chebyshev, device=thetas.device)
     bs = 2 ** 8
-    for c1 in tqdm(range(0, len(stream_coeffs), bs)):
-        c2 = min(c1 + bs, len(stream_coeffs))
-        stream_coeffs_batch = torch.zeros((c2-c1, len(stream_coeffs)), device=thetas.device)
+    for c1 in tqdm(range(0, len(coeffs), bs)):
+        c2 = min(c1 + bs, len(coeffs))
+        coeffs_batch = torch.zeros((c2-c1, len(coeffs)), device=thetas.device)
         diag_idx = torch.arange(c1, c2, device=thetas.device)
-        stream_coeffs_batch[diag_idx-c1, diag_idx] = 1.0
+        coeffs_batch[diag_idx-c1, diag_idx] = 1.0
         fourier_bases = torch.cat([torch.cos(ms * thetas[..., None]),
                                     torch.sin(ms * thetas[..., None])], dim=-1) # ... (M 2)
         chebyshev_bases = chebyshev_polynomial_t(zs[..., None], ks) # ... K
         combined_bases = chebyshev_bases[..., None] * fourier_bases[..., None, :] # ... K, (M 2)
         combined_bases = combined_bases.reshape((*zs.shape, -1))
-        tform_naive = einsum(combined_bases, stream_coeffs_batch, 
+        tform_naive = einsum(combined_bases, coeffs_batch, 
                              '... C, N C -> N ...')
         
     # Fast transform
@@ -1401,13 +1401,13 @@ def test_fast_transforms(thetas: torch.Tensor,
         tform_fast *= torch.exp(1j * alphas * (K_chebyshev // 2))
         tform_fast = tform_fast.real * (M_fourier * K_chebyshev) ** 0.5
         return tform_fast
-    for c1 in tqdm(range(0, len(stream_coeffs), bs)):
-        c2 = min(c1 + bs, len(stream_coeffs))
-        stream_coeffs_batch = torch.zeros((c2-c1, len(stream_coeffs)), device=thetas.device)
+    for c1 in tqdm(range(0, len(coeffs), bs)):
+        c2 = min(c1 + bs, len(coeffs))
+        coeffs_batch = torch.zeros((c2-c1, len(coeffs)), device=thetas.device)
         diag_idx = torch.arange(c1, c2, device=thetas.device)
-        stream_coeffs_batch[diag_idx-c1, diag_idx] = 1.0
-        stream_coeffs_rs = rearrange(stream_coeffs_batch, 'N (K two M) -> N K M two', K=K_chebyshev, M=M_fourier)
-        cs = stream_coeffs_rs[..., 0] -1j * stream_coeffs_rs[..., 1] # K, M
+        coeffs_batch[diag_idx-c1, diag_idx] = 1.0
+        coeffs_rs = rearrange(coeffs_batch, 'N (K two M) -> N K M two', K=K_chebyshev, M=M_fourier)
+        cs = coeffs_rs[..., 0] -1j * coeffs_rs[..., 1] # K, M
         tform_fast = 0.5 * (nufft2d(cs, thetas, torch.acos(zs)) + \
                             nufft2d(cs, thetas, -torch.acos(zs)))
     
